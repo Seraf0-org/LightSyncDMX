@@ -287,11 +287,6 @@ LightSyncDMX/
 
 ---
 
-## パッケージビルド方法 (配布者向け)
-
-`BuildPlugin.bat` を実行すると `PackagedPlugin/` にバイナリ同梱のプラグインが生成されます。
-そのフォルダを ZIP にして配布してください。
-
 ## ライセンス
 
 Copyright UE-Comp. All Rights Reserved.
