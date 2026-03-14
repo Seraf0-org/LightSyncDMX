@@ -33,7 +33,8 @@ static const TCHAR* ColorModeNames[] = {
     TEXT("RGBW (4ch)"),
     TEXT("RGBAW (5ch)"),
     TEXT("Dimmer+RGB (4ch)"),
-    TEXT("CCT+Brightness (2ch)")
+    TEXT("CCT+Brightness (2ch)"),
+    TEXT("CCT & RGBW (10ch)")
 };
 static constexpr int32 NumColorModes = UE_ARRAY_COUNT(ColorModeNames);
 
@@ -616,6 +617,62 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
             .OnValueChanged_Lambda([W](float V) {
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].BrightnessScale = V;
+            }));
+
+    // 10ch専用: Ch2 Green/Magenta
+    AddLabeledRow(LOCTEXT("DMX10ChGreenMagenta", "10ch Ch2 Green/Magenta"),
+        SNew(SSpinBox<int32>)
+            .MinValue(0).MaxValue(255).Delta(1)
+            .Value_Lambda([W]() -> int32 {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                    return W->DMXOutput->FixtureMappings[0].CCTRGBW10_GreenMagenta;
+                return 0;
+            })
+            .OnValueChanged_Lambda([W](int32 V) {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                    W->DMXOutput->FixtureMappings[0].CCTRGBW10_GreenMagenta = V;
+            }));
+
+    // 10ch専用: Ch4 CCT->RGBW Crossfade
+    AddLabeledRow(LOCTEXT("DMX10ChCrossfade", "10ch Ch4 Crossfade"),
+        SNew(SSpinBox<int32>)
+            .MinValue(0).MaxValue(255).Delta(1)
+            .Value_Lambda([W]() -> int32 {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                    return W->DMXOutput->FixtureMappings[0].CCTRGBW10_Crossfade;
+                return 255;
+            })
+            .OnValueChanged_Lambda([W](int32 V) {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                    W->DMXOutput->FixtureMappings[0].CCTRGBW10_Crossfade = V;
+            }));
+
+    // 10ch専用: Ch9 Strobe
+    AddLabeledRow(LOCTEXT("DMX10ChStrobe", "10ch Ch9 Strobe"),
+        SNew(SSpinBox<int32>)
+            .MinValue(0).MaxValue(255).Delta(1)
+            .Value_Lambda([W]() -> int32 {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                    return W->DMXOutput->FixtureMappings[0].CCTRGBW10_Strobe;
+                return 0;
+            })
+            .OnValueChanged_Lambda([W](int32 V) {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                    W->DMXOutput->FixtureMappings[0].CCTRGBW10_Strobe = V;
+            }));
+
+    // 10ch専用: Ch10 Reserved
+    AddLabeledRow(LOCTEXT("DMX10ChReserved", "10ch Ch10 Reserved"),
+        SNew(SSpinBox<int32>)
+            .MinValue(0).MaxValue(255).Delta(1)
+            .Value_Lambda([W]() -> int32 {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                    return W->DMXOutput->FixtureMappings[0].CCTRGBW10_Reserved10;
+                return 0;
+            })
+            .OnValueChanged_Lambda([W](int32 V) {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                    W->DMXOutput->FixtureMappings[0].CCTRGBW10_Reserved10 = V;
             }));
 
     // マスターディマー (個別)

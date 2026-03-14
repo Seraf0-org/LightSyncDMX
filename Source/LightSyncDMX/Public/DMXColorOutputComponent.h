@@ -25,6 +25,8 @@ enum class ELightSyncColorMode : uint8
     DRGB UMETA(DisplayName = "Dimmer+RGB (4ch)"),
     /** 色温度 + 明度 の2チャンネル */
     CCT UMETA(DisplayName = "CCT+Brightness (2ch)"),
+    /** 10ch: CCT/GreenMagenta/Dimmer/Crossfade/R/G/B/W/Strobe/Reserved */
+    CCTRGBW10CH UMETA(DisplayName = "CCT & RGBW (10ch)"),
 };
 
 /**
@@ -59,6 +61,22 @@ struct LIGHTSYNCDMX_API FDMXFixtureMapping
     /** 個別の明度オフセット (0.0 - 2.0) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX", meta = (ClampMin = "0.0", ClampMax = "2.0"))
     float BrightnessScale = 1.0f;
+
+    /** 10chモード: Ch2 Green/Magenta 制御値 (0-255, 0=Neutral/No Effect) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
+    int32 CCTRGBW10_GreenMagenta = 0;
+
+    /** 10chモード: Ch4 CCT↔RGBW クロスフェード (0=CCT, 255=RGBW) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
+    int32 CCTRGBW10_Crossfade = 255;
+
+    /** 10chモード: Ch9 ストロボ値 (0=OFF) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
+    int32 CCTRGBW10_Strobe = 0;
+
+    /** 10chモード: Ch10 予備チャンネル値 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
+    int32 CCTRGBW10_Reserved10 = 0;
 };
 
 /**

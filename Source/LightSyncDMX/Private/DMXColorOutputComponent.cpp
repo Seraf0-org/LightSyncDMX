@@ -196,6 +196,36 @@ TMap<int32, uint8> UDMXColorOutputComponent::ColorToDMXChannels(
         Channels.Add(Ch + 1, FloatToByte(Brightness));
         break;
     }
+
+    case ELightSyncColorMode::CCTRGBW10CH:
+    {
+        // 10ch: CCT & RGBW 8bit
+        // Ch1: CCT(2700K-7500K)
+        // Ch2: Green/Magenta
+        // Ch3: Dimmer
+        // Ch4: Crossfade (CCT -> RGBW)
+        // Ch5-8: R,G,B,W
+        // Ch9: Strobe
+        // Ch10: Reserved
+
+        float CCT, Brightness;
+        RGBtoCCTBrightness(R, G, B, CCT, Brightness);
+
+        float OutR, OutG, OutB, OutW;
+        RGBtoRGBW(R, G, B, OutR, OutG, OutB, OutW);
+
+        Channels.Add(Ch + 0, FloatToByte(CCT));
+        Channels.Add(Ch + 1, static_cast<uint8>(FMath::Clamp(Mapping.CCTRGBW10_GreenMagenta, 0, 255)));
+        Channels.Add(Ch + 2, FloatToByte(Brightness));
+        Channels.Add(Ch + 3, static_cast<uint8>(FMath::Clamp(Mapping.CCTRGBW10_Crossfade, 0, 255)));
+        Channels.Add(Ch + 4, FloatToByte(OutR));
+        Channels.Add(Ch + 5, FloatToByte(OutG));
+        Channels.Add(Ch + 6, FloatToByte(OutB));
+        Channels.Add(Ch + 7, FloatToByte(OutW));
+        Channels.Add(Ch + 8, static_cast<uint8>(FMath::Clamp(Mapping.CCTRGBW10_Strobe, 0, 255)));
+        Channels.Add(Ch + 9, static_cast<uint8>(FMath::Clamp(Mapping.CCTRGBW10_Reserved10, 0, 255)));
+        break;
+    }
     }
 
     return Channels;
