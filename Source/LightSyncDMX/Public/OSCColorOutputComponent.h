@@ -114,7 +114,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC|Config")
     FString OSCProbeName = TEXT("probe01");
 
-    /** 送信レート制限 (Hz) - OSCパケット数を抑える */
+    /** 送信レート制限 (Hz) - SamplingRate より低い場合はOSCパケットを間引く */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC|Config", meta = (ClampMin = "1", ClampMax = "120"))
     float OSCSendRate = 30.0f;
 
@@ -196,6 +196,6 @@ private:
     /** DasLight 互換フォーマットで送信 */
     void SendDasLightFormat(UOSCClient *Client, const FOSCTargetConfig &Config, const FLinearColor &Color);
 
-    /** 送信レート制御タイマー */
-    float SendRateTimer = 0.0f;
+    /** 最後にOSCを送信した時刻 */
+    double LastOSCSendTimeSeconds = -1.0;
 };

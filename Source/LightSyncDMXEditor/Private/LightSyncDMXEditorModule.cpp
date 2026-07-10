@@ -21,7 +21,7 @@ void FLightSyncDMXEditorModule::StartupModule()
                                 FOnSpawnTab::CreateLambda([](const FSpawnTabArgs &Args) -> TSharedRef<SDockTab>
                                                           { return SNew(SDockTab)
                                                                 .TabRole(ETabRole::NomadTab)
-                                                                .Label(LOCTEXT("TabTitle", "LightSync Monitor"))
+                                                                .Label(LOCTEXT("TabTitle", "LightSync DMX Monitor"))
                                                                     [SNew(SLightSyncMonitorWidget)]; }))
         .SetDisplayName(LOCTEXT("TabDisplayName", "LightSync DMX Monitor"))
         .SetGroup(WorkspaceMenu::GetMenuStructure().GetDeveloperToolsMiscCategory())

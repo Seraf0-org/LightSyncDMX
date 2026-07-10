@@ -87,7 +87,7 @@ void FLightSyncGPUSampler::Initialize()
 
     if (bGPUPathAvailable)
     {
-        ReadbackBuffer = MakeUnique<FRHIGPUBufferReadback>(TEXT("LightSync_Readback"));
+        ReadbackBuffer = MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("LightSync_Readback"));
         UE_LOG(LogLightSyncDMX, Log, TEXT("LightSyncGPUSampler: GPU パス使用 (SM5+)"));
     }
     else
@@ -96,10 +96,30 @@ void FLightSyncGPUSampler::Initialize()
                TEXT("LightSyncGPUSampler: フィーチャーレベルが SM5 未満のため CPU フォールバックを使用"));
     }
 
-    FMemory::Memzero(ReadbackRawData, sizeof(ReadbackRawData));
-    bDispatched        = false;
-    bReadbackDataReady = false;
-    bInitialized       = true;
+    ReadbackState = MakeShared<FReadbackSharedState, ESPMode::ThreadSafe>();
+    FMemory::Memzero(ReadbackState->RawData, sizeof(ReadbackState->RawData));
+    ReadbackState->RawParams = Params;
+    ReadbackState->bDataReady = false;
+    InFlightParams = Params;
+    bDispatched    = false;
+    bInitialized   = true;
+}
+
+void FLightSyncGPUSampler::SetForceCPUSync(bool bInForceCPUSync)
+{
+    if (bForceCPUSync == bInForceCPUSync)
+    {
+        return;
+    }
+
+    bForceCPUSync = bInForceCPUSync;
+    bDispatched = false;
+
+    if (ReadbackState)
+    {
+        FScopeLock Lock(&ReadbackState->Lock);
+        ReadbackState->bDataReady = false;
+    }
 }
 
 void FLightSyncGPUSampler::Release()
@@ -109,15 +129,10 @@ void FLightSyncGPUSampler::Release()
         return;
     }
 
-    // 進行中のレンダーコマンドがすべて完了するまで待つ
-    FlushRenderingCommands();
-
+    // キュー済みレンダーコマンドは TSharedPtr で readback の寿命を保持する。
+    // UObject 破棄中に FlushRenderingCommands() で同期しない。
     ReadbackBuffer.Reset();
-
-    {
-        FScopeLock Lock(&ReadbackResultLock);
-        bReadbackDataReady = false;
-    }
+    ReadbackState.Reset();
 
     bInitialized     = false;
     bDispatched      = false;
@@ -137,7 +152,7 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
         return;
     }
 
-    if (!bGPUPathAvailable)
+    if (ShouldUseCPUPath())
     {
         // CPU 同期フォールバック: 結果はこの呼び出しで即座に Cached* に書き込まれる
         ComputeAverageColor_CPUSync(CubeRT);
@@ -146,32 +161,49 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
 
     // --- 前フレームのリードバックをレンダースレッドでポーリングする ---
     // IsReady/Lock/Unlock は必ずレンダースレッドから呼ぶ。
-    // 結果を ReadbackRawData (FCriticalSection 保護) に書き込み、
-    // ゲームスレッドは TryGetResult() で bReadbackDataReady フラグを確認する。
+    // 結果を共有状態に書き込み、ゲームスレッドは TryGetResult() で取得する。
     if (bDispatched)
     {
-        FRHIGPUBufferReadback* ReadbackPtr = ReadbackBuffer.Get();
-        FCriticalSection*      LockPtr     = &ReadbackResultLock;
-        FVector4f*             RawDataPtr  = ReadbackRawData;
-        bool*                  ReadyFlagPtr = &bReadbackDataReady;
+        bool bNeedsPoll = false;
+        TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> SharedState = ReadbackState;
+        if (!SharedState.IsValid())
+        {
+            return;
+        }
 
-        ENQUEUE_RENDER_COMMAND(LightSyncPollReadback)(
-            [ReadbackPtr, LockPtr, RawDataPtr, ReadyFlagPtr]
-            (FRHICommandListImmediate& /*RHICmdList*/)
-            {
-                if (ReadbackPtr->IsReady())
+        {
+            FScopeLock Lock(&SharedState->Lock);
+            bNeedsPoll = !SharedState->bDataReady;
+        }
+
+        if (bNeedsPoll)
+        {
+            TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackPtr = ReadbackBuffer;
+            const FSamplingParams  ResultParams = InFlightParams;
+
+            ENQUEUE_RENDER_COMMAND(LightSyncPollReadback)(
+                [ReadbackPtr, SharedState, ResultParams]
+                (FRHICommandListImmediate& /*RHICmdList*/)
                 {
-                    const FVector4f* Src = static_cast<const FVector4f*>(
-                        ReadbackPtr->Lock(12 * sizeof(FVector4f)));
-                    if (Src)
+                    if (ReadbackPtr.IsValid() && ReadbackPtr->IsReady())
                     {
-                        FScopeLock Lock(LockPtr);
-                        FMemory::Memcpy(RawDataPtr, Src, 12 * sizeof(FVector4f));
-                        *ReadyFlagPtr = true;
+                        const FVector4f* Src = static_cast<const FVector4f*>(
+                            ReadbackPtr->Lock(12 * sizeof(FVector4f)));
+                        if (Src)
+                        {
+                            FScopeLock Lock(&SharedState->Lock);
+                            FMemory::Memcpy(SharedState->RawData, Src, 12 * sizeof(FVector4f));
+                            SharedState->RawParams = ResultParams;
+                            SharedState->bDataReady = true;
+                        }
+                        ReadbackPtr->Unlock();
                     }
-                    ReadbackPtr->Unlock();
-                }
-            });
+                });
+        }
+
+        // 前回の AddEnqueueCopyPass が未取得の間は同じ ReadbackBuffer に
+        // 新しいコピーを積まない。
+        return;
     }
 
     // --- GPU テクスチャ参照をゲームスレッドで取得 ---
@@ -186,9 +218,15 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
 
     const uint32 TexSize = static_cast<uint32>(CubeRT->SizeX);
     const FSamplingParams CapturedParams = Params;
-    FRHIGPUBufferReadback* ReadbackPtr   = ReadbackBuffer.Get();
+    TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackPtr = ReadbackBuffer;
+    if (!ReadbackPtr.IsValid())
+    {
+        ComputeAverageColor_CPUSync(CubeRT);
+        return;
+    }
 
     bDispatched = true;
+    InFlightParams = CapturedParams;
 
     ENQUEUE_RENDER_COMMAND(LightSyncDispatchCS)(
         [CubeTextureRHI, TexSize, CapturedParams, ReadbackPtr]
@@ -245,7 +283,7 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
             }
 
             // 結果をリードバックバッファにコピー (GPU → CPU ステージング)
-            AddEnqueueCopyPass(GraphBuilder, ReadbackPtr, OutputBuf,
+            AddEnqueueCopyPass(GraphBuilder, ReadbackPtr.Get(), OutputBuf,
                                12 * sizeof(FVector4f));
 
             GraphBuilder.Execute();
@@ -263,7 +301,7 @@ bool FLightSyncGPUSampler::TryGetResult(
     FLinearColor& OutDominantColor)
 {
     // CPU パス: DispatchSampling() で即時書き込み済み
-    if (!bGPUPathAvailable)
+    if (ShouldUseCPUPath())
     {
         if (bResultReady)
         {
@@ -279,13 +317,17 @@ bool FLightSyncGPUSampler::TryGetResult(
     // GPU パス: レンダースレッドがデータを書き込んでいれば取得する
     // (IsReady/Lock/Unlock はレンダースレッドの ENQUEUE_RENDER_COMMAND 内で行う)
     {
-        FScopeLock Lock(&ReadbackResultLock);
-        if (bReadbackDataReady)
+        TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> SharedState = ReadbackState;
+        if (SharedState.IsValid())
         {
-            ProcessReadbackData(ReadbackRawData);
-            bReadbackDataReady = false;
-            bDispatched        = false;
-            bResultReady       = true;
+            FScopeLock Lock(&SharedState->Lock);
+            if (SharedState->bDataReady)
+            {
+                ProcessReadbackData(SharedState->RawData, SharedState->RawParams);
+                SharedState->bDataReady = false;
+                bDispatched             = false;
+                bResultReady            = true;
+            }
         }
     }
 
@@ -306,16 +348,16 @@ bool FLightSyncGPUSampler::TryGetResult(
 // ProcessReadbackData — GPU 結果をポスト処理
 // ============================================================
 
-void FLightSyncGPUSampler::ProcessReadbackData(const FVector4f* Data)
+void FLightSyncGPUSampler::ProcessReadbackData(const FVector4f* Data, const FSamplingParams& ResultParams)
 {
     // 面設定ウェイト (UE5 は Z-up: +Z=天頂, -Z=床)
     const float FaceWeights[6] = {
-        Params.SideFaceWeight,    // +X
-        Params.SideFaceWeight,    // -X
-        Params.SideFaceWeight,    // +Y
-        Params.SideFaceWeight,    // -Y
-        Params.TopFaceWeight,     // +Z (Top: 空/天井)
-        Params.BottomFaceWeight,  // -Z (Bottom: 床)
+        ResultParams.SideFaceWeight,    // +X
+        ResultParams.SideFaceWeight,    // -X
+        ResultParams.SideFaceWeight,    // +Y
+        ResultParams.SideFaceWeight,    // -Y
+        ResultParams.TopFaceWeight,     // +Z (Top: 空/天井)
+        ResultParams.BottomFaceWeight,  // -Z (Bottom: 床)
     };
 
     // --- 全体平均 ---
@@ -395,17 +437,19 @@ void FLightSyncGPUSampler::ProcessReadbackData(const FVector4f* Data)
     }
 
     // トーンマッピングを適用
-    CachedAverageColor  = ApplyToneMapping(CachedAverageColor);
-    CachedTopColor      = ApplyToneMapping(CachedTopColor);
-    CachedSideColor     = ApplyToneMapping(CachedSideColor);
-    CachedDominantColor = ApplyToneMapping(CachedDominantColor);
+    CachedAverageColor  = ApplyToneMapping(CachedAverageColor, ResultParams);
+    CachedTopColor      = ApplyToneMapping(CachedTopColor, ResultParams);
+    CachedSideColor     = ApplyToneMapping(CachedSideColor, ResultParams);
+    CachedDominantColor = ApplyToneMapping(CachedDominantColor, ResultParams);
 }
 
 // ============================================================
 // ApplyToneMapping — Reinhard + 彩度ブースト
 // ============================================================
 
-FLinearColor FLightSyncGPUSampler::ApplyToneMapping(const FLinearColor& HDRColor) const
+FLinearColor FLightSyncGPUSampler::ApplyToneMapping(
+    const FLinearColor& HDRColor,
+    const FSamplingParams& ToneMappingParams) const
 {
     FLinearColor Result = HDRColor;
 
@@ -413,7 +457,7 @@ FLinearColor FLightSyncGPUSampler::ApplyToneMapping(const FLinearColor& HDRColor
 
     if (Lum > KINDA_SMALL_NUMBER)
     {
-        const float LumExposed = Lum * Params.ToneMappingExposure;
+        const float LumExposed = Lum * ToneMappingParams.ToneMappingExposure;
         const float MappedLum  = LumExposed / (1.0f + LumExposed); // Reinhard
 
         const float Scale = MappedLum / Lum;
@@ -421,14 +465,14 @@ FLinearColor FLightSyncGPUSampler::ApplyToneMapping(const FLinearColor& HDRColor
         Result.G *= Scale;
         Result.B *= Scale;
 
-        if (!FMath::IsNearlyEqual(Params.SaturationBoost, 1.0f))
+        if (!FMath::IsNearlyEqual(ToneMappingParams.SaturationBoost, 1.0f))
         {
             const float NewLum = 0.2126f * Result.R + 0.7152f * Result.G + 0.0722f * Result.B;
             if (NewLum > KINDA_SMALL_NUMBER)
             {
-                Result.R = NewLum + (Result.R - NewLum) * Params.SaturationBoost;
-                Result.G = NewLum + (Result.G - NewLum) * Params.SaturationBoost;
-                Result.B = NewLum + (Result.B - NewLum) * Params.SaturationBoost;
+                Result.R = NewLum + (Result.R - NewLum) * ToneMappingParams.SaturationBoost;
+                Result.G = NewLum + (Result.G - NewLum) * ToneMappingParams.SaturationBoost;
+                Result.B = NewLum + (Result.B - NewLum) * ToneMappingParams.SaturationBoost;
             }
         }
     }
@@ -507,7 +551,7 @@ void FLightSyncGPUSampler::ComputeAverageColor_CPUSync(UTextureRenderTargetCube*
         float  FaceMaxLum  = 0.0f;
         FLinearColor FaceMaxColor = FLinearColor::Black;
 
-        const int32 Step = FMath::Max(1, Size / 8);
+        const int32 Step = FMath::Max(1, Size / FMath::Max(Params.DownsampleResolution, 1));
         for (int32 Y = 0; Y < Size; Y += Step)
         {
             for (int32 X = 0; X < Size; X += Step)
@@ -599,10 +643,10 @@ void FLightSyncGPUSampler::ComputeAverageColor_CPUSync(UTextureRenderTargetCube*
 
     CachedDominantColor = MaxLuminanceColor;
 
-    CachedAverageColor  = ApplyToneMapping(CachedAverageColor);
-    CachedTopColor      = ApplyToneMapping(CachedTopColor);
-    CachedSideColor     = ApplyToneMapping(CachedSideColor);
-    CachedDominantColor = ApplyToneMapping(CachedDominantColor);
+    CachedAverageColor  = ApplyToneMapping(CachedAverageColor, Params);
+    CachedTopColor      = ApplyToneMapping(CachedTopColor, Params);
+    CachedSideColor     = ApplyToneMapping(CachedSideColor, Params);
+    CachedDominantColor = ApplyToneMapping(CachedDominantColor, Params);
 
     bResultReady = true;
 }

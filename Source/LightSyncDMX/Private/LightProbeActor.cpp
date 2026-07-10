@@ -27,7 +27,8 @@ ALightProbeActor::ALightProbeActor()
     ProbeMesh->SetupAttachment(SceneRoot);
     ProbeMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     ProbeMesh->SetCastShadow(false);
-    ProbeMesh->bVisibleInSceneCaptureOnly = false;
+    ProbeMesh->SetVisibleInSceneCaptureOnly(false);
+    ProbeMesh->SetHiddenInSceneCapture(true);
     ProbeMesh->SetHiddenInGame(true); // ゲーム中は非表示
 
     // 球体メッシュをデフォルト設定
@@ -159,7 +160,7 @@ void ALightProbeActor::Tick(float DeltaTime)
 
     if (SamplingTimer >= SamplingInterval)
     {
-        SamplingTimer = 0.0f;
+        SamplingTimer = FMath::Fmod(SamplingTimer, SamplingInterval);
         ForceSampleOnce();
     }
 }

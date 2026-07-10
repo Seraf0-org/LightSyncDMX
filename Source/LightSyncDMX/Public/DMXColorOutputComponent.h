@@ -158,4 +158,7 @@ private:
 
     /** RGB → 色温度(CCT) + 明度 変換 */
     void RGBtoCCTBrightness(float R, float G, float B, float &OutCCT, float &OutBrightness) const;
+
+    /** DMX出力ポート未設定警告を一度だけ出すためのフラグ */
+    bool bWarnedNoOutputPorts = false;
 };

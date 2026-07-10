@@ -7,6 +7,7 @@
 #include "OSCMessage.h"
 #include "OSCBundle.h"
 #include "OSCManager.h"
+#include "HAL/PlatformTime.h"
 
 UOSCColorOutputComponent::UOSCColorOutputComponent()
 {
@@ -90,6 +91,14 @@ void UOSCColorOutputComponent::SendColor(const FLinearColor &Color)
     // エディタモードではBeginPlayが呼ばれないため、遅延初期化
     EnsureClientsInitialized();
 
+    const double NowSeconds = FPlatformTime::Seconds();
+    const double MinInterval = 1.0 / FMath::Max(static_cast<double>(OSCSendRate), 1.0);
+    if (LastOSCSendTimeSeconds >= 0.0 && (NowSeconds - LastOSCSendTimeSeconds) < MinInterval)
+    {
+        return;
+    }
+
+    LastOSCSendTimeSeconds = NowSeconds;
     LastSentColor = Color;
 
     for (int32 i = 0; i < Targets.Num(); ++i)
@@ -369,7 +378,19 @@ void UOSCColorOutputComponent::SendCustomOSCInt(const FString &Address, int32 Va
 
 void UOSCColorOutputComponent::Blackout()
 {
-    SendColor(FLinearColor::Black);
+    EnsureClientsInitialized();
+
+    LastSentColor = FLinearColor::Black;
+
+    for (int32 i = 0; i < Targets.Num(); ++i)
+    {
+        if (Targets[i].bEnabled)
+        {
+            SendToTarget(i, FLinearColor::Black);
+        }
+    }
+
+    SentMessageCount++;
 }
 
 void UOSCColorOutputComponent::AddTarget(const FOSCTargetConfig &Config)

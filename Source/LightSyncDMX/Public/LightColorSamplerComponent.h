@@ -8,7 +8,6 @@
 #include "LightColorSamplerComponent.generated.h"
 
 class UTextureRenderTargetCube;
-class UTextureRenderTarget2D;
 
 /** サンプリング方式 */
 UENUM(BlueprintType)
@@ -147,6 +146,8 @@ public:
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+    virtual void OnUnregister() override;
+    virtual void BeginDestroy() override;
 
 private:
     // === GPU Compute 方式 ===
@@ -157,13 +158,11 @@ private:
     /** GPU サンプラーの初期化 */
     void InitializeGPUSampler();
 
-    // === CPU Sync 方式 (フォールバック) ===
+    /** GPU サンプラーの安全な解放 */
+    void ReleaseGPUSampler();
 
-    /** CubeMapの各面を読み取って平均色を計算 (CPU同期方式) */
-    FLinearColor ReadAverageColorFromCube_CPUSync(UTextureRenderTargetCube *CubeRT);
-
-    /** 2DレンダーターゲットからピクセルデータをCPUに読み取り */
-    FLinearColor ReadAverageFromPixels(const TArray<FFloat16Color> &Pixels, int32 Width, int32 Height);
+    /** GPU/CPU サンプラーへ現在の設定を反映 */
+    void UpdateSamplerParams();
 
     /** 色のスムージング (EMA: Exponential Moving Average) */
     FLinearColor SmoothColor(const FLinearColor &NewColor, const FLinearColor &PreviousColor, float Alpha);

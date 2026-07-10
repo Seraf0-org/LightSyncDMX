@@ -108,11 +108,17 @@ void UDMXColorOutputComponent::SendDMXData(const FDMXFixtureMapping &Mapping, co
 
     if (OutputPorts.Num() == 0)
     {
-        UE_LOG(LogLightSyncDMX, Warning,
-               TEXT("DMXColorOutput: DMX出力ポートが設定されていません。"
-                    "Project Settings → Plugins → DMX Protocol で出力ポートを設定してください。"));
+        if (!bWarnedNoOutputPorts)
+        {
+            UE_LOG(LogLightSyncDMX, Warning,
+                   TEXT("DMXColorOutput: DMX出力ポートが設定されていません。"
+                        "Project Settings → Plugins → DMX Protocol で出力ポートを設定してください。"));
+            bWarnedNoOutputPorts = true;
+        }
         return;
     }
+
+    bWarnedNoOutputPorts = false;
 
     for (const FDMXOutputPortSharedRef &OutputPort : OutputPorts)
     {

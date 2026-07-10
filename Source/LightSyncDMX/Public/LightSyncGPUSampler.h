@@ -55,9 +55,11 @@ public:
         float SideFaceWeight       = 1.0f;
         float ToneMappingExposure  = 0.5f;
         float SaturationBoost      = 2.0f;
+        int32 DownsampleResolution = 8;
     };
 
     void SetParams(const FSamplingParams& InParams) { Params = InParams; }
+    void SetForceCPUSync(bool bInForceCPUSync);
     bool IsInitialized() const { return bInitialized; }
 
 private:
@@ -73,23 +75,32 @@ private:
     bool bDispatched       = false; // GPU ディスパッチが進行中 (ゲームスレッドのみ書き込み)
     bool bResultReady      = false; // キャッシュに有効な結果がある
     bool bGPUPathAvailable = false;
+    bool bForceCPUSync     = false;
 
     // GPU Async Readback バッファ (12 × FVector4f)
-    TUniquePtr<FRHIGPUBufferReadback> ReadbackBuffer;
+    TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackBuffer;
 
-    // レンダースレッド → ゲームスレッド結果転送用
-    // ReadbackBuffer の IsReady/Lock/Unlock は必ずレンダースレッドで行う。
-    // レンダースレッドが結果を書き込み、ゲームスレッドが消費する。
-    mutable FCriticalSection ReadbackResultLock;
-    FVector4f                ReadbackRawData[12];         // Initialize() で Memzero
-    bool                     bReadbackDataReady  = false; // ReadbackResultLock で保護
+    // レンダースレッド → ゲームスレッド結果転送用。
+    // キュー済みコマンドがサンプラー破棄後に本体メンバへ触れないよう共有状態に分離する。
+    struct FReadbackSharedState
+    {
+        mutable FCriticalSection Lock;
+        FVector4f RawData[12];
+        FSamplingParams RawParams;
+        bool bDataReady = false;
+    };
+
+    TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> ReadbackState;
+    FSamplingParams InFlightParams;
 
     // GPU Readback データを処理して Cached* に書き込む
-    void ProcessReadbackData(const FVector4f* Data);
+    void ProcessReadbackData(const FVector4f* Data, const FSamplingParams& ResultParams);
 
     // トーンマッピング (Reinhard + 彩度ブースト)
-    FLinearColor ApplyToneMapping(const FLinearColor& HDRColor) const;
+    FLinearColor ApplyToneMapping(const FLinearColor& HDRColor, const FSamplingParams& ToneMappingParams) const;
 
     // CPU 同期フォールバック
     void ComputeAverageColor_CPUSync(UTextureRenderTargetCube* CubeRT);
+
+    bool ShouldUseCPUPath() const { return bForceCPUSync || !bGPUPathAvailable; }
 };

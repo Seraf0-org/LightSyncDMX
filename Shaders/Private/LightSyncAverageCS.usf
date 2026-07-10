@@ -35,7 +35,7 @@ groupshared float4 gs_Dominant[64];    // (R, G, B, luminance) -- a=-1 は未割
 
 // -------------------------------------------------------------------
 // Face UV [0,1]^2 → CubeMap サンプリング方向ベクトル
-// UE の CubeMap 面順序: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
+// UE の CubeMap 面順序: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z(Top), 5=-Z(Bottom)
 // -------------------------------------------------------------------
 float3 FaceUVToDirection(uint face, float2 uv)
 {
@@ -46,10 +46,10 @@ float3 FaceUVToDirection(uint face, float2 uv)
     {
         case 0u: return float3( 1.0f,  t,   -s  ); // +X
         case 1u: return float3(-1.0f,  t,    s  ); // -X
-        case 2u: return float3( s,     1.0f, -t  ); // +Y (Top)
-        case 3u: return float3( s,    -1.0f,  t  ); // -Y (Bottom)
-        case 4u: return float3( s,     t,    1.0f); // +Z
-        case 5u: return float3(-s,     t,   -1.0f); // -Z
+        case 2u: return float3( s,     1.0f, -t  ); // +Y
+        case 3u: return float3( s,    -1.0f,  t  ); // -Y
+        case 4u: return float3( s,     t,    1.0f); // +Z (Top)
+        case 5u: return float3(-s,     t,   -1.0f); // -Z (Bottom)
         default: return float3(0.0f, 0.0f, 1.0f);
     }
 }

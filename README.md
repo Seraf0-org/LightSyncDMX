@@ -23,7 +23,7 @@ UEシーンの光源
 ┌─────────────────────────┐
 │    LightProbeActor      │   ← シーンに配置する光プローブ
 │  ┌───────────────────┐  │
-│  │ SceneCaptureEcube │  │   ← 360°キャプチャ
+│  │ SceneCaptureCube  │  │   ← 360°キャプチャ
 │  └─────────┬─────────┘  │
 │            ↓            │
 │  ┌───────────────────┐  │
@@ -31,12 +31,12 @@ UEシーンの光源
 │  └─────────┬─────────┘  │
 │            ↓            │
 │  ┌───────────────────┐  │
-│  │ DMXColorOutput    │  │   ← DMX信号に変換して送信 (同一PC)
-│  └───────────────────┘  │
-│            ↓            │
-│  ┌───────────────────┐  │
-│  │ OSCColorOutput    │  │   ← OSCで別PCに色データを送信
-│  └───────────────────┘  │
+│  │ Output Selection  │  │
+│  └──────┬──────┬─────┘  │
+│         ↓      ↓        │
+│  ┌─────────┐ ┌─────────┐│
+│  │ DMX Out │ │ OSC Out ││
+│  └─────────┘ └─────────┘│
 └─────────────────────────┘
       ↓ (Art-Net / sACN)       ↓ (OSC over Network)
    LED照明器具           別PC (QLC+ / DasLight)
@@ -90,7 +90,7 @@ UEシーンの光源
 - Blueprint/C++ から統一的にアクセス可能
 
 ### LightSyncDMXEditor (Editor Module)
-- **LightSync Monitor** ウィンドウ: Window → Virtual Production → LightSync DMX Monitor
+- **LightSync DMX Monitor** ウィンドウ: Window → Virtual Production → LightSync DMX Monitor
 - リアルタイムでプローブ状態、色、DMXチャンネルを確認
 - **方向別カラープレビュー**: Average / Top / Side / Dominant を並列表示
 - マスターコントロール (一括有効/無効、ブラックアウト、ディマー)
@@ -217,8 +217,8 @@ VP撮影では、照明の位置によって異なる色が必要になること
 | ソース | 説明 | 用途 |
 |--------|------|------|
 | Average | 全方向の輝度加重平均 | 一般的な照明同期 |
-| Top | 上方向 (+Y) のみ | 天井に配置したPavoTube等 |
-| Side | 横方向 (±X, ±Z) のみ | 側面に配置したPavoTube等 |
+| Top | 上方向 (+Z) のみ | 天井に配置したPavoTube等 |
+| Side | 横方向 (±X, ±Y) のみ | 側面に配置したPavoTube等 |
 | Dominant | 最も明るい光源の色 | スポットライト使用時 |
 
 **使い方:**
@@ -295,7 +295,7 @@ LightSyncDMX/
          Source/
    ```
 3. UE Editor を起動（自動で有効化される）
-4. **Window > Virtual Production > LightSync Monitor** からモニターウィンドウを開く
+4. **Window > Virtual Production > LightSync DMX Monitor** からモニターウィンドウを開く
 
 ### ソースからビルドする場合 (開発者向け)
 
