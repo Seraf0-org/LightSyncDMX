@@ -15,13 +15,13 @@
 	"IsExperimentalVersion": false,
 	"Installed": true,
 	"EnabledByDefault": true,
-	"EngineVersion": "5.4.0",
+	"EngineVersion": "5.7.0",
 	"SupportedTargetPlatforms": [ "Win64" ],
 	"Modules": [
 		{
 			"Name": "LightSyncDMX",
 			"Type": "Runtime",
-			"LoadingPhase": "Default",
+			"LoadingPhase": "PostConfigInit",
 			"AdditionalDependencies": [
 				"Engine",
 				"CoreUObject"

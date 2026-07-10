@@ -106,6 +106,14 @@ void UDMXColorOutputComponent::SendDMXData(const FDMXFixtureMapping &Mapping, co
     FDMXPortManager &PortManager = FDMXPortManager::Get();
     const TArray<FDMXOutputPortSharedRef> &OutputPorts = PortManager.GetOutputPorts();
 
+    if (OutputPorts.Num() == 0)
+    {
+        UE_LOG(LogLightSyncDMX, Warning,
+               TEXT("DMXColorOutput: DMX出力ポートが設定されていません。"
+                    "Project Settings → Plugins → DMX Protocol で出力ポートを設定してください。"));
+        return;
+    }
+
     for (const FDMXOutputPortSharedRef &OutputPort : OutputPorts)
     {
         OutputPort->SendDMX(Mapping.Universe, ChannelData);
@@ -162,8 +170,8 @@ TMap<int32, uint8> UDMXColorOutputComponent::ColorToDMXChannels(
         // 5ch: R, G, B, Amber, White
         float OutR, OutG, OutB, OutW;
         RGBtoRGBW(R, G, B, OutR, OutG, OutB, OutW);
-        // Amber = R と G の混合成分
-        float Amber = FMath::Min(R, G * 0.5f);
+        // Amber = R と G が重なる黄色成分 (min(R,G) が正しい)
+        float Amber = FMath::Min(R, G);
         Channels.Add(Ch + 0, FloatToByte(OutR));
         Channels.Add(Ch + 1, FloatToByte(OutG));
         Channels.Add(Ch + 2, FloatToByte(OutB));

@@ -62,6 +62,7 @@ private:
     // === 状態 ===
     float RefreshTimer = 0.0f;
     float RefreshInterval = 0.5f;
+    int32 CachedProbeCount = -1;
 
     TSharedPtr<SVerticalBox> ProbeListBox;
     TSharedPtr<SVerticalBox> SettingsPanelBox;

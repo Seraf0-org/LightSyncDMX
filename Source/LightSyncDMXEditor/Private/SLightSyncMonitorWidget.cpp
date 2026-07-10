@@ -37,6 +37,8 @@ static const TCHAR* ColorModeNames[] = {
     TEXT("CCT & RGBW (10ch)")
 };
 static constexpr int32 NumColorModes = UE_ARRAY_COUNT(ColorModeNames);
+// ELightSyncColorMode に値を追加したら ColorModeNames も同時に更新すること
+static_assert(NumColorModes == 6, "ColorModeNames と ELightSyncColorMode の要素数が一致していません");
 
 static const TCHAR* OSCFormatNames[] = {
     TEXT("Float RGB"),
@@ -47,6 +49,8 @@ static const TCHAR* OSCFormatNames[] = {
     TEXT("カスタム")
 };
 static constexpr int32 NumOSCFormats = UE_ARRAY_COUNT(OSCFormatNames);
+// EOSCMessageFormat に値を追加したら OSCFormatNames も同時に更新すること
+static_assert(NumOSCFormats == 6, "OSCFormatNames と EOSCMessageFormat の要素数が一致していません");
 
 // ============================================================
 // Construct
@@ -124,7 +128,13 @@ void SLightSyncMonitorWidget::Tick(
     if (RefreshTimer >= RefreshInterval)
     {
         RefreshTimer = 0.0f;
-        RefreshProbeList();
+        // プローブ数が変わった時だけリストを再構築
+        TArray<ALightProbeActor*> CurrentProbes = GetAllProbeActors();
+        if (CurrentProbes.Num() != CachedProbeCount)
+        {
+            CachedProbeCount = CurrentProbes.Num();
+            RefreshProbeList();
+        }
     }
 }
 
@@ -252,18 +262,9 @@ void SLightSyncMonitorWidget::RefreshProbeList()
         }
 
         const FString ProbeName = Probe->GetProbeName();
-        const FLinearColor Color = Probe->GetCurrentColor();
-        const bool bIsSelected = (ProbeName == SelectedProbeName);
-        const FLinearColor RowBg = bIsSelected
-            ? FLinearColor(0.12f, 0.22f, 0.42f)
-            : FLinearColor(0.03f, 0.03f, 0.03f);
+        TWeakObjectPtr<ALightProbeActor> WeakProbe = Probe;
 
-        const FString RGBText = FString::Printf(TEXT("R:%3d G:%3d B:%3d"),
-            FMath::RoundToInt(Color.R * 255),
-            FMath::RoundToInt(Color.G * 255),
-            FMath::RoundToInt(Color.B * 255));
-
-        // DMX情報
+        // DMX情報 (静的)
         FString DMXInfo = TEXT("-");
         if (Probe->bUseDMXOutput && Probe->DMXOutput
             && Probe->DMXOutput->FixtureMappings.Num() > 0)
@@ -272,17 +273,22 @@ void SLightSyncMonitorWidget::RefreshProbeList()
             DMXInfo = FString::Printf(TEXT("U%d Ch%d"), M.Universe, M.StartChannel);
         }
 
-        // OSC情報
+        // OSC情報 (静的)
         const FString OSCInfo = Probe->bUseOSCOutput ? TEXT("ON") : TEXT("-");
 
-        // 位置
+        // 位置 (静的)
         const FVector Loc = Probe->GetActorLocation();
         const FString LocText = FString::Printf(TEXT("%.0f, %.0f, %.0f"), Loc.X, Loc.Y, Loc.Z);
 
         ProbeListBox->AddSlot().AutoHeight()
             [
                 SNew(SBorder)
-                    .BorderBackgroundColor(FSlateColor(RowBg))
+                    .BorderBackgroundColor_Lambda([this, ProbeName]() {
+                        const bool bIsSelected = (ProbeName == SelectedProbeName);
+                        return FSlateColor(bIsSelected
+                            ? FLinearColor(0.12f, 0.22f, 0.42f)
+                            : FLinearColor(0.03f, 0.03f, 0.03f));
+                    })
                     .Padding(FMargin(0.0f))
                     [
                         SNew(SButton)
@@ -298,28 +304,56 @@ void SLightSyncMonitorWidget::RefreshProbeList()
                                     .VAlign(VAlign_Center)
                                     [SNew(STextBlock).Text(FText::FromString(ProbeName))]
 
-                                // 状態
+                                // 状態 (動的)
                                 + SHorizontalBox::Slot().FillWidth(0.06f).Padding(2.0f)
                                     .VAlign(VAlign_Center)
                                     [SNew(STextBlock)
-                                        .Text(Probe->bIsProbeActive
-                                            ? LOCTEXT("Active", "●")
-                                            : LOCTEXT("Inactive", "○"))
-                                        .ColorAndOpacity(Probe->bIsProbeActive
-                                            ? FSlateColor(FLinearColor::Green)
-                                            : FSlateColor(FLinearColor::Gray))]
+                                        .Text_Lambda([WeakProbe]() {
+                                            if (WeakProbe.IsValid())
+                                            {
+                                                return WeakProbe->bIsProbeActive
+                                                    ? LOCTEXT("Active", "●")
+                                                    : LOCTEXT("Inactive", "○");
+                                            }
+                                            return LOCTEXT("Invalid", "-");
+                                        })
+                                        .ColorAndOpacity_Lambda([WeakProbe]() {
+                                            if (WeakProbe.IsValid() && WeakProbe->bIsProbeActive)
+                                            {
+                                                return FSlateColor(FLinearColor::Green);
+                                            }
+                                            return FSlateColor(FLinearColor::Gray);
+                                        })]
 
-                                // 色プレビュー
+                                // 色プレビュー (動的)
                                 + SHorizontalBox::Slot().FillWidth(0.06f).Padding(2.0f)
                                     .VAlign(VAlign_Center)
                                     [SNew(SBox).WidthOverride(32.0f).HeightOverride(16.0f)
-                                        [SNew(SColorBlock).Color(Color)
+                                        [SNew(SColorBlock)
+                                            .Color_Lambda([WeakProbe]() {
+                                                if (WeakProbe.IsValid())
+                                                {
+                                                    return WeakProbe->GetCurrentColor();
+                                                }
+                                                return FLinearColor::Black;
+                                            })
                                             .ShowBackgroundForAlpha(false)]]
 
-                                // RGB
+                                // RGB (動的)
                                 + SHorizontalBox::Slot().FillWidth(0.20f).Padding(2.0f)
                                     .VAlign(VAlign_Center)
-                                    [SNew(STextBlock).Text(FText::FromString(RGBText))]
+                                    [SNew(STextBlock)
+                                        .Text_Lambda([WeakProbe]() {
+                                            if (WeakProbe.IsValid())
+                                            {
+                                                const FLinearColor Color = WeakProbe->GetCurrentColor();
+                                                return FText::FromString(FString::Printf(TEXT("R:%3d G:%3d B:%3d"),
+                                                    FMath::RoundToInt(Color.R * 255),
+                                                    FMath::RoundToInt(Color.G * 255),
+                                                    FMath::RoundToInt(Color.B * 255)));
+                                            }
+                                            return FText::FromString(TEXT("-"));
+                                        })]
 
                                 // DMX
                                 + SHorizontalBox::Slot().FillWidth(0.14f).Padding(2.0f)
@@ -503,6 +537,77 @@ void SLightSyncMonitorWidget::BuildColorCorrectionSection(ALightProbeActor* Prob
             .MinValue(0.0f).MaxValue(0.1f).Delta(0.005f)
             .Value_Lambda([W]() { return W.IsValid() ? W->ColorOnlyBlackThreshold : 0.01f; })
             .OnValueChanged_Lambda([W](float V) { if (W.IsValid()) W->ColorOnlyBlackThreshold = V; }));
+
+    // === 方向別カラープレビュー ===
+    AddSectionHeader(LOCTEXT("SecDirectionalColors", "方向別カラープレビュー"));
+
+    // 全体平均
+    AddLabeledRow(LOCTEXT("AvgColor", "全体平均"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(24.0f)
+                [SNew(SColorBlock)
+                    .Color_Lambda([W]() { return W.IsValid() ? W->GetCurrentColor() : FLinearColor::Black; })
+                    .ShowBackgroundForAlpha(false)]]
+        + SHorizontalBox::Slot().AutoWidth().Padding(8.0f, 0.0f, 0.0f, 0.0f).VAlign(VAlign_Center)
+            [SNew(STextBlock)
+                .Text_Lambda([W]() -> FText {
+                    if (!W.IsValid()) return FText::GetEmpty();
+                    FLinearColor C = W->GetCurrentColor();
+                    return FText::FromString(FString::Printf(TEXT("R:%3d G:%3d B:%3d"),
+                        FMath::RoundToInt(C.R * 255), FMath::RoundToInt(C.G * 255), FMath::RoundToInt(C.B * 255)));
+                })]);
+
+    // 上方向 (Top)
+    AddLabeledRow(LOCTEXT("TopColor", "上方向 (天井ライト)"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(24.0f)
+                [SNew(SColorBlock)
+                    .Color_Lambda([W]() { return W.IsValid() ? W->GetTopColor() : FLinearColor::Black; })
+                    .ShowBackgroundForAlpha(false)]]
+        + SHorizontalBox::Slot().AutoWidth().Padding(8.0f, 0.0f, 0.0f, 0.0f).VAlign(VAlign_Center)
+            [SNew(STextBlock)
+                .Text_Lambda([W]() -> FText {
+                    if (!W.IsValid()) return FText::GetEmpty();
+                    FLinearColor C = W->GetTopColor();
+                    return FText::FromString(FString::Printf(TEXT("R:%3d G:%3d B:%3d"),
+                        FMath::RoundToInt(C.R * 255), FMath::RoundToInt(C.G * 255), FMath::RoundToInt(C.B * 255)));
+                })]);
+
+    // 横方向 (Side)
+    AddLabeledRow(LOCTEXT("SideColor", "横方向 (側面ライト)"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(24.0f)
+                [SNew(SColorBlock)
+                    .Color_Lambda([W]() { return W.IsValid() ? W->GetSideColor() : FLinearColor::Black; })
+                    .ShowBackgroundForAlpha(false)]]
+        + SHorizontalBox::Slot().AutoWidth().Padding(8.0f, 0.0f, 0.0f, 0.0f).VAlign(VAlign_Center)
+            [SNew(STextBlock)
+                .Text_Lambda([W]() -> FText {
+                    if (!W.IsValid()) return FText::GetEmpty();
+                    FLinearColor C = W->GetSideColor();
+                    return FText::FromString(FString::Printf(TEXT("R:%3d G:%3d B:%3d"),
+                        FMath::RoundToInt(C.R * 255), FMath::RoundToInt(C.G * 255), FMath::RoundToInt(C.B * 255)));
+                })]);
+
+    // Dominant (最も明るい)
+    AddLabeledRow(LOCTEXT("DominantColor", "最も明るい光源"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(24.0f)
+                [SNew(SColorBlock)
+                    .Color_Lambda([W]() { return W.IsValid() ? W->GetDominantColor() : FLinearColor::Black; })
+                    .ShowBackgroundForAlpha(false)]]
+        + SHorizontalBox::Slot().AutoWidth().Padding(8.0f, 0.0f, 0.0f, 0.0f).VAlign(VAlign_Center)
+            [SNew(STextBlock)
+                .Text_Lambda([W]() -> FText {
+                    if (!W.IsValid()) return FText::GetEmpty();
+                    FLinearColor C = W->GetDominantColor();
+                    return FText::FromString(FString::Printf(TEXT("R:%3d G:%3d B:%3d"),
+                        FMath::RoundToInt(C.R * 255), FMath::RoundToInt(C.G * 255), FMath::RoundToInt(C.B * 255)));
+                })]);
 }
 
 // ============================================================
@@ -534,6 +639,21 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
                 if (W.IsValid() && W->DMXOutput)
                     W->DMXOutput->bDMXOutputEnabled = (S == ECheckBoxState::Checked);
+            }));
+
+    // DMXカラーソース
+    static const TCHAR* ColorSourceNames[] = {
+        TEXT("全体平均"),
+        TEXT("上方向 (天井ライト)"),
+        TEXT("横方向 (側面ライト)"),
+        TEXT("最も明るい光源")
+    };
+    AddLabeledRow(LOCTEXT("DMXColorSource", "カラーソース"),
+        SNew(STextBlock)
+            .Text_Lambda([W]() -> FText {
+                if (!W.IsValid()) return FText::GetEmpty();
+                int32 Idx = static_cast<int32>(W->DMXColorSource);
+                return FText::FromString(ColorSourceNames[FMath::Clamp(Idx, 0, 3)]);
             }));
 
     // フィクスチャ名

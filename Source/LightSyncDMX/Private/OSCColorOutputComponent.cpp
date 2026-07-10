@@ -70,7 +70,8 @@ void UOSCColorOutputComponent::InitializeClients()
         }
     }
 
-    bIsConnected = OSCClients.Num() > 0;
+    // 有効なクライアントが1つ以上あるときだけ接続済みとみなす
+    bIsConnected = OSCClients.ContainsByPredicate([](const UOSCClient* C) { return C != nullptr; });
 }
 
 void UOSCColorOutputComponent::DestroyClients()

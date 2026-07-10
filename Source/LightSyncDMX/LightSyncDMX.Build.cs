@@ -7,6 +7,7 @@ public class LightSyncDMX : ModuleRules
     public LightSyncDMX(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+        CppStandard = CppStandardVersion.Cpp20;
 
         PublicDependencyModuleNames.AddRange(new string[]
         {
@@ -17,6 +18,7 @@ public class LightSyncDMX : ModuleRules
             "RenderCore",
             "RHI",
             "Renderer",
+            "Projects",       // IPluginManager (シェーダーディレクトリマッピング用)
             "DMXProtocol",
             "DMXRuntime",
             "OSC",

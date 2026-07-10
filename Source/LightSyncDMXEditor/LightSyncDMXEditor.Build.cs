@@ -7,6 +7,7 @@ public class LightSyncDMXEditor : ModuleRules
     public LightSyncDMXEditor(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+        CppStandard = CppStandardVersion.Cpp20;
 
         PublicDependencyModuleNames.AddRange(new string[]
         {

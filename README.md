@@ -59,11 +59,14 @@ UEシーンの光源
 - シーンに配置するメインのActor
 - `SceneCaptureComponentCube` で360°の環境光をキャプチャ
 - 色補正機能 (ガンマ、色温度、彩度、明度)
+- **方向別カラー出力**: Average / Top / Side / Dominant から選択可能
 - エディタ上で視覚的にプローブ位置を確認可能
 
 ### LightColorSamplerComponent
 - CubeMapレンダーターゲットからピクセルデータを読み取り
-- ダウンサンプリングで効率的に平均色を算出
+- **輝度加重平均**: 明るい光源の影響を強く反映
+- **方向別カラー**: Top (天井) / Side (側面) / Dominant (最も明るい) を個別に算出
+- サンプリング方式: GPU Compute (高速) / CPU Sync (フォールバック)
 - EMA (指数移動平均) によるスムージングでちらつきを抑制
 - HDRクランプと暗部閾値による精度向上
 
@@ -89,6 +92,7 @@ UEシーンの光源
 ### LightSyncDMXEditor (Editor Module)
 - **LightSync Monitor** ウィンドウ: Window → Virtual Production → LightSync DMX Monitor
 - リアルタイムでプローブ状態、色、DMXチャンネルを確認
+- **方向別カラープレビュー**: Average / Top / Side / Dominant を並列表示
 - マスターコントロール (一括有効/無効、ブラックアウト、ディマー)
 
 ---
@@ -178,13 +182,18 @@ LightSyncBPLibrary::DMXValuesToLinearColor(R, G, B)
 
 | 設定 | 推奨値 | 備考 |
 |------|--------|------|
+| Sampling Method | GPU Compute | 高速・非同期、複数プローブでもスケール |
 | Capture Resolution | 64 | 色の平均なので低解像度で十分 |
 | Sampling Rate | 30 Hz | 映像と同期する場合はフレームレートに合わせる |
-| Downsample Resolution | 8 | CPU読み取りピクセル数を制限 |
+| Luminance Exponent | 2.0 | 輝度加重の強さ (高い=明るい光源重視) |
 | Smoothing Alpha | 0.3 | 低い = よりスムーズ、高い = よりレスポンシブ |
 
-1プローブあたりの GPU コスト: ~0.1ms (64x64 CubeMap)
-1プローブあたりの CPU コスト: ~0.05ms (SmoothStep + DMX送信)
+### サンプリング方式の比較
+
+| 方式 | プローブ数 | CPU負荷 | 備考 |
+|------|-----------|---------|------|
+| GPU Compute | 10個以上可能 | 低 | 非同期ReadBack、2フレーム遅延 |
+| CPU Sync | 2-3個推奨 | 高 | フォールバック用 |
 
 ---
 
@@ -200,12 +209,33 @@ LightSyncBPLibrary::DMXValuesToLinearColor(R, G, B)
 
 ---
 
+## 方向別カラー出力
+
+VP撮影では、照明の位置によって異なる色が必要になることがあります。
+本プラグインは以下の4種類のカラーソースを提供します:
+
+| ソース | 説明 | 用途 |
+|--------|------|------|
+| Average | 全方向の輝度加重平均 | 一般的な照明同期 |
+| Top | 上方向 (+Y) のみ | 天井に配置したPavoTube等 |
+| Side | 横方向 (±X, ±Z) のみ | 側面に配置したPavoTube等 |
+| Dominant | 最も明るい光源の色 | スポットライト使用時 |
+
+**使い方:**
+1. LightProbeActor の Details パネルで **DMX Color Source** / **OSC Color Source** を設定
+2. 複数のプローブを使って、異なる位置から異なる方向のカラーを取得することも可能
+
+---
+
 ## ファイル構成
 
 ```
 LightSyncDMX/
 ├── LightSyncDMX.uplugin
 ├── README.md
+├── Shaders/                           (GPU Compute Shaders)
+│   └── Private/
+│       └── LightSyncAverageCS.usf
 └── Source/
     ├── LightSyncDMX/                  (Runtime Module)
     │   ├── LightSyncDMX.Build.cs
@@ -213,6 +243,7 @@ LightSyncDMX/
     │   │   ├── LightSyncDMXModule.h
     │   │   ├── LightProbeActor.h
     │   │   ├── LightColorSamplerComponent.h
+    │   │   ├── LightSyncGPUSampler.h
     │   │   ├── DMXColorOutputComponent.h
     │   │   ├── OSCColorOutputComponent.h
     │   │   ├── LightSyncSubsystem.h
@@ -221,6 +252,7 @@ LightSyncDMX/
     │       ├── LightSyncDMXModule.cpp
     │       ├── LightProbeActor.cpp
     │       ├── LightColorSamplerComponent.cpp
+    │       ├── LightSyncGPUSampler.cpp
     │       ├── DMXColorOutputComponent.cpp
     │       ├── OSCColorOutputComponent.cpp
     │       ├── LightSyncSubsystem.cpp
@@ -239,7 +271,7 @@ LightSyncDMX/
 
 ## 動作要件
 
-- Unreal Engine 5.4 (ビルド済みバイナリは 5.4 専用)
+- Unreal Engine 5.7 (ビルド済みバイナリは 5.7 専用)
 - DMX Protocol プラグイン (UE標準同梱)
 - DMX Engine プラグイン (UE標準同梱)
 - OSC プラグイン (UE標準同梱 - OSC出力使用時)
@@ -286,6 +318,11 @@ LightSyncDMX/
      ```
 
 ---
+
+## パッケージビルド方法 (配布者向け)
+
+`BuildPlugin.bat` を実行すると `PackagedPlugin/` にバイナリ同梱のプラグインが生成されます。
+そのフォルダを ZIP にして配布してください。
 
 ## ライセンス
 

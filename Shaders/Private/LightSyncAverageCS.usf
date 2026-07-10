@@ -1,0 +1,124 @@
+// Copyright UE-Comp. All Rights Reserved.
+// LightSync DMX - CubeMap Luminance-Weighted Average Compute Shader
+//
+// TextureCube 全体をバインドし、面ごとに方向ベクトルでサンプリング。
+// 1面につき1ディスパッチ (FaceIndex = 0..5) で呼ばれる。
+//
+// 出力バッファ (12 x float4):
+//   [0..5]  : 面ごとの加重和  (R*w, G*w, B*w, totalWeight)
+//   [6..11] : 面ごとの最大輝度ピクセル (R, G, B, luminance)
+// CPU 側で 6 面分を集計して Average / Top / Side / Dominant を算出する。
+
+#include "/Engine/Public/Platform.ush"
+
+// --- リソースバインディング ---
+
+TextureCube<float4> InputCube;
+SamplerState        InputSampler;
+
+RWStructuredBuffer<float4> OutputBuffer;
+
+// --- 定数 ---
+
+uint  TextureSize;
+uint  FaceIndex;            // 0=+X  1=-X  2=+Y  3=-Y  4=+Z(Top/Sky)  5=-Z(Bottom/Floor)
+float LuminanceExponent;
+float DarkThreshold;
+float HDRClamp;
+float DirectLightThreshold; // 0 = フィルター無効
+uint  bFilterDirectLight;
+
+// --- スレッドグループ共有メモリ (8x8 = 64 スレッド) ---
+
+groupshared float4 gs_ColorWeight[64]; // (R*w, G*w, B*w, totalWeight)
+groupshared float4 gs_Dominant[64];    // (R, G, B, luminance) -- a=-1 は未割当
+
+// -------------------------------------------------------------------
+// Face UV [0,1]^2 → CubeMap サンプリング方向ベクトル
+// UE の CubeMap 面順序: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
+// -------------------------------------------------------------------
+float3 FaceUVToDirection(uint face, float2 uv)
+{
+    float s =  uv.x * 2.0f - 1.0f;
+    float t = -(uv.y * 2.0f - 1.0f); // V 反転
+
+    switch (face)
+    {
+        case 0u: return float3( 1.0f,  t,   -s  ); // +X
+        case 1u: return float3(-1.0f,  t,    s  ); // -X
+        case 2u: return float3( s,     1.0f, -t  ); // +Y (Top)
+        case 3u: return float3( s,    -1.0f,  t  ); // -Y (Bottom)
+        case 4u: return float3( s,     t,    1.0f); // +Z
+        case 5u: return float3(-s,     t,   -1.0f); // -Z
+        default: return float3(0.0f, 0.0f, 1.0f);
+    }
+}
+
+// -------------------------------------------------------------------
+// メインカーネル: numthreads(8,8,1)  1ディスパッチ = 1面
+// -------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void MainCS(uint3 GroupThreadId : SV_GroupThreadID,
+            uint  GroupIndex    : SV_GroupIndex)
+{
+    float4 localCW  = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 localDom = float4(0.0f, 0.0f, 0.0f, -1.0f); // a=-1 -> 未割当
+
+    // 1スレッドが処理するピクセル範囲
+    uint ppX    = max(1u, (TextureSize + 7u) / 8u);
+    uint ppY    = max(1u, (TextureSize + 7u) / 8u);
+    uint startX = GroupThreadId.x * ppX;
+    uint startY = GroupThreadId.y * ppY;
+    uint endX   = min(startX + ppX, TextureSize);
+    uint endY   = min(startY + ppY, TextureSize);
+
+    for (uint y = startY; y < endY; y++)
+    {
+        for (uint x = startX; x < endX; x++)
+        {
+            float2 uv  = (float2(x, y) + 0.5f) / (float)TextureSize;
+            float3 dir = FaceUVToDirection(FaceIndex, uv);
+
+            float4 px = InputCube.SampleLevel(InputSampler, dir, 0);
+            px.rgb = min(px.rgb, HDRClamp);
+
+            float lum = dot(px.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+            if (lum < DarkThreshold) continue;
+            if (bFilterDirectLight && lum > DirectLightThreshold) continue;
+
+            float w = pow(lum, LuminanceExponent);
+            localCW.rgb += px.rgb * w;
+            localCW.a   += w;
+
+            if (lum > localDom.a)
+                localDom = float4(px.rgb, lum);
+        }
+    }
+
+    gs_ColorWeight[GroupIndex] = localCW;
+    gs_Dominant[GroupIndex]    = localDom;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Parallel reduction: 64 -> 1
+    for (uint stride = 32u; stride > 0u; stride >>= 1u)
+    {
+        if (GroupIndex < stride)
+        {
+            gs_ColorWeight[GroupIndex].rgb += gs_ColorWeight[GroupIndex + stride].rgb;
+            gs_ColorWeight[GroupIndex].a   += gs_ColorWeight[GroupIndex + stride].a;
+
+            if (gs_Dominant[GroupIndex + stride].a > gs_Dominant[GroupIndex].a)
+                gs_Dominant[GroupIndex] = gs_Dominant[GroupIndex + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // スレッド 0 だけ書き込む
+    if (GroupIndex == 0u)
+    {
+        OutputBuffer[FaceIndex]      = gs_ColorWeight[0];
+
+        float4 dom = gs_Dominant[0];
+        OutputBuffer[6u + FaceIndex] = (dom.a > 0.0f) ? dom : float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}

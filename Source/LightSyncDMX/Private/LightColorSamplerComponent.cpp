@@ -1,6 +1,7 @@
 // Copyright UE-Comp. All Rights Reserved.
 
 #include "LightColorSamplerComponent.h"
+#include "LightSyncGPUSampler.h"
 #include "LightSyncDMXModule.h"
 
 #include "Engine/TextureRenderTargetCube.h"
@@ -14,10 +15,56 @@ ULightColorSamplerComponent::ULightColorSamplerComponent()
     PrimaryComponentTick.bCanEverTick = false; // Tick不要、LightProbeActorから呼ばれる
 }
 
+ULightColorSamplerComponent::~ULightColorSamplerComponent()
+{
+    GPUSampler.Reset();
+}
+
 void ULightColorSamplerComponent::BeginPlay()
 {
     Super::BeginPlay();
     bIsFirstSample = true;
+    
+    // GPU Compute 方式の場合は初期化
+    if (SamplingMethod == ELightSyncSamplingMethod::GPUCompute)
+    {
+        InitializeGPUSampler();
+    }
+}
+
+void ULightColorSamplerComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (GPUSampler)
+    {
+        GPUSampler->Release();
+        GPUSampler.Reset();
+    }
+    
+    Super::EndPlay(EndPlayReason);
+}
+
+void ULightColorSamplerComponent::InitializeGPUSampler()
+{
+    if (!GPUSampler)
+    {
+        GPUSampler = MakeUnique<FLightSyncGPUSampler>();
+    }
+    
+    GPUSampler->Initialize();
+    
+    // パラメータを設定
+    FLightSyncGPUSampler::FSamplingParams Params;
+    Params.LuminanceExponent = LuminanceExponent;
+    Params.DarkThreshold = DarkThreshold;
+    Params.HDRClamp = HDRClampValue;
+    Params.DirectLightThreshold = DirectLightThreshold;
+    Params.bFilterDirectLight = bFilterDirectLight;
+    Params.TopFaceWeight = TopFaceWeight;
+    Params.BottomFaceWeight = BottomFaceWeight;
+    Params.SideFaceWeight = SideFaceWeight;
+    Params.ToneMappingExposure = ToneMappingExposure;
+    Params.SaturationBoost = SaturationBoost;
+    GPUSampler->SetParams(Params);
 }
 
 void ULightColorSamplerComponent::SampleFromRenderTarget(UTextureRenderTargetCube *InCubeRT)
@@ -27,22 +74,89 @@ void ULightColorSamplerComponent::SampleFromRenderTarget(UTextureRenderTargetCub
         return;
     }
 
-    // CubeMapの平均色を読み取る
-    RawSampledColor = ReadAverageColorFromCube(InCubeRT);
+    FLinearColor NewAverageColor = FLinearColor::Black;
+    FLinearColor NewTopColor = FLinearColor::Black;
+    FLinearColor NewSideColor = FLinearColor::Black;
+    FLinearColor NewDominantColor = FLinearColor::Black;
+
+    if (SamplingMethod == ELightSyncSamplingMethod::GPUCompute)
+    {
+        // === GPU Compute 方式 ===
+        if (!GPUSampler || !GPUSampler->IsInitialized())
+        {
+            InitializeGPUSampler();
+        }
+
+        if (GPUSampler)
+        {
+            // パラメータを更新
+            FLightSyncGPUSampler::FSamplingParams Params;
+            Params.LuminanceExponent = LuminanceExponent;
+            Params.DarkThreshold = DarkThreshold;
+            Params.HDRClamp = HDRClampValue;
+            Params.DirectLightThreshold = DirectLightThreshold;
+            Params.bFilterDirectLight = bFilterDirectLight;
+            Params.TopFaceWeight = TopFaceWeight;
+            Params.BottomFaceWeight = BottomFaceWeight;
+            Params.SideFaceWeight = SideFaceWeight;
+            Params.ToneMappingExposure = ToneMappingExposure;
+            Params.SaturationBoost = SaturationBoost;
+            GPUSampler->SetParams(Params);
+
+            // サンプリングをディスパッチ
+            GPUSampler->DispatchSampling(InCubeRT);
+
+            // 結果を取得 (前フレームの結果が返る、2フレーム遅延)
+            if (GPUSampler->TryGetResult(NewAverageColor, NewTopColor, NewSideColor, NewDominantColor))
+            {
+                RawSampledColor = NewAverageColor;
+            }
+            else
+            {
+                // 結果がまだない場合は前の値を維持
+                NewAverageColor = RawSampledColor;
+                NewTopColor = TopColor;
+                NewSideColor = SideColor;
+                NewDominantColor = DominantColor;
+            }
+        }
+    }
+    else
+    {
+        // === CPU Sync 方式 (フォールバック) ===
+        NewAverageColor = ReadAverageColorFromCube_CPUSync(InCubeRT);
+        RawSampledColor = NewAverageColor;
+        
+        // CPU方式では方向別カラーは平均と同じ (簡略化)
+        NewTopColor = NewAverageColor;
+        NewSideColor = NewAverageColor;
+        NewDominantColor = NewAverageColor;
+    }
 
     // スムージング適用
     if (bIsFirstSample)
     {
-        SmoothedColor = RawSampledColor;
+        SmoothedColor = NewAverageColor;
+        TopColor = NewTopColor;
+        SideColor = NewSideColor;
+        DominantColor = NewDominantColor;
         bIsFirstSample = false;
     }
     else
     {
-        SmoothedColor = SmoothColor(RawSampledColor, SmoothedColor, SmoothingAlpha);
+        SmoothedColor = SmoothColor(NewAverageColor, SmoothedColor, SmoothingAlpha);
+        TopColor = SmoothColor(NewTopColor, PrevTopColor, SmoothingAlpha);
+        SideColor = SmoothColor(NewSideColor, PrevSideColor, SmoothingAlpha);
+        DominantColor = SmoothColor(NewDominantColor, PrevDominantColor, SmoothingAlpha);
     }
+
+    // 前フレーム値を保存
+    PrevTopColor = TopColor;
+    PrevSideColor = SideColor;
+    PrevDominantColor = DominantColor;
 }
 
-FLinearColor ULightColorSamplerComponent::ReadAverageColorFromCube(UTextureRenderTargetCube *CubeRT)
+FLinearColor ULightColorSamplerComponent::ReadAverageColorFromCube_CPUSync(UTextureRenderTargetCube *CubeRT)
 {
     if (!CubeRT || !CubeRT->GetResource())
     {
@@ -123,7 +237,7 @@ FLinearColor ULightColorSamplerComponent::ReadAverageFromPixels(
     double AccumR = 0.0;
     double AccumG = 0.0;
     double AccumB = 0.0;
-    int32 ValidCount = 0;
+    double TotalWeight = 0.0;
 
     // ダウンサンプリング: 全ピクセルではなくステップ刻みで読む
     const int32 StepX = FMath::Max(1, Width / DownsampleResolution);
@@ -156,32 +270,39 @@ FLinearColor ULightColorSamplerComponent::ReadAverageFromPixels(
                 continue;
             }
 
-            AccumR += R;
-            AccumG += G;
-            AccumB += B;
-            ValidCount++;
+            // 直接光フィルター: 明るすぎるピクセルは直接光源とみなして除外
+            if (bFilterDirectLight && Luminance > DirectLightThreshold)
+            {
+                continue;
+            }
+
+            // 輝度加重 (明るいピクセルほど重み大)
+            float Weight = FMath::Pow(Luminance, LuminanceExponent);
+
+            AccumR += R * Weight;
+            AccumG += G * Weight;
+            AccumB += B * Weight;
+            TotalWeight += Weight;
         }
     }
 
-    if (ValidCount == 0)
+    if (TotalWeight < KINDA_SMALL_NUMBER)
     {
         return FLinearColor::Black;
     }
 
-    // HDR平均値を算出
+    // 輝度加重平均を算出
     FLinearColor Result;
-    Result.R = static_cast<float>(AccumR / ValidCount);
-    Result.G = static_cast<float>(AccumG / ValidCount);
-    Result.B = static_cast<float>(AccumB / ValidCount);
+    Result.R = static_cast<float>(AccumR / TotalWeight);
+    Result.G = static_cast<float>(AccumG / TotalWeight);
+    Result.B = static_cast<float>(AccumB / TotalWeight);
     Result.A = 1.0f;
 
     // === 輝度ベース Reinhard トーンマッピング (色相保持) ===
-    // per-channel Reinhard は明るいチャンネルほど圧縮率が高く色相がシフトする。
-    // 輝度を基準にトーンマッピングし、RGB を比例スケーリングすることで色相を保つ。
     const float Exposure = ToneMappingExposure;
 
     // Rec.709 輝度
-    const float Lum = 0.2126f * Result.R + 0.7152f * Result.G + 0.0722f * Result.B;
+    float Lum = 0.2126f * Result.R + 0.7152f * Result.G + 0.0722f * Result.B;
 
     if (Lum > KINDA_SMALL_NUMBER)
     {
@@ -194,6 +315,20 @@ FLinearColor ULightColorSamplerComponent::ReadAverageFromPixels(
         Result.R *= Scale;
         Result.G *= Scale;
         Result.B *= Scale;
+
+        // === 彩度ブースト (白飛び対策) ===
+        if (SaturationBoost != 1.0f)
+        {
+            // トーンマッピング後の輝度を再計算
+            const float NewLum = 0.2126f * Result.R + 0.7152f * Result.G + 0.0722f * Result.B;
+            if (NewLum > KINDA_SMALL_NUMBER)
+            {
+                // 彩度を強調 (輝度を維持しながら色差を増幅)
+                Result.R = NewLum + (Result.R - NewLum) * SaturationBoost;
+                Result.G = NewLum + (Result.G - NewLum) * SaturationBoost;
+                Result.B = NewLum + (Result.B - NewLum) * SaturationBoost;
+            }
+        }
     }
     else
     {
@@ -203,10 +338,10 @@ FLinearColor ULightColorSamplerComponent::ReadAverageFromPixels(
         Result.B = 0.0f;
     }
 
-    // トーンマッピング後のクランプ (浮動小数点の微小な超過対策)
-    Result.R = FMath::Min(Result.R, 1.0f);
-    Result.G = FMath::Min(Result.G, 1.0f);
-    Result.B = FMath::Min(Result.B, 1.0f);
+    // トーンマッピング後のクランプ
+    Result.R = FMath::Clamp(Result.R, 0.0f, 1.0f);
+    Result.G = FMath::Clamp(Result.G, 0.0f, 1.0f);
+    Result.B = FMath::Clamp(Result.B, 0.0f, 1.0f);
 
     return Result;
 }

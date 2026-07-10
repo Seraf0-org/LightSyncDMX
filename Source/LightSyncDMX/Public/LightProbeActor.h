@@ -14,6 +14,23 @@ class UTextureRenderTargetCube;
 class UStaticMeshComponent;
 class UBillboardComponent;
 
+/** 出力で使用する色の方向ソース */
+UENUM(BlueprintType)
+enum class ELightProbeColorSource : uint8
+{
+    /** 全体平均 (デフォルト) */
+    Average UMETA(DisplayName = "Average (All Directions)"),
+    
+    /** 上方向のみ (天井ライト用) */
+    Top UMETA(DisplayName = "Top (Ceiling Lights)"),
+    
+    /** 横方向のみ (側面ライト用) */
+    Side UMETA(DisplayName = "Side (Wall Lights)"),
+    
+    /** 最も明るい光源 (スポットライト用) */
+    Dominant UMETA(DisplayName = "Dominant (Brightest)")
+};
+
 /**
  * ALightProbeActor
  *
@@ -86,6 +103,18 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
     FString ProbeName = TEXT("LightProbe_01");
 
+    // === 出力色ソース ===
+
+    /** DMX出力に使用する色のソース */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Output")
+    ELightProbeColorSource DMXColorSource = ELightProbeColorSource::Average;
+
+    /** OSC出力に使用する色のソース */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Output")
+    ELightProbeColorSource OSCColorSource = ELightProbeColorSource::Average;
+
+    // === 色補正 ===
+
     /** ガンマ補正値 (1.0=リニア出力, 2.2=sRGB変換) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Color", meta = (ClampMin = "0.1", ClampMax = "5.0"))
     float GammaCorrection = 1.0f;
@@ -112,9 +141,21 @@ public:
 
     // === 出力 (読み取り専用) ===
 
-    /** 現在のサンプリング結果色 */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output")
+    /** 現在のサンプリング結果色 (全体平均) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output|Colors")
     FLinearColor CurrentSampledColor;
+
+    /** 上方向の色 */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output|Colors")
+    FLinearColor CurrentTopColor;
+
+    /** 横方向の色 */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output|Colors")
+    FLinearColor CurrentSideColor;
+
+    /** 最も明るい光源の色 */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output|Colors")
+    FLinearColor CurrentDominantColor;
 
     /** DMX送信用に補正された色 */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output")
@@ -130,9 +171,25 @@ public:
     UFUNCTION(BlueprintCallable, Category = "LightProbe")
     void ForceSampleOnce();
 
-    /** 現在のサンプリング色を取得 */
+    /** 現在のサンプリング色を取得 (全体平均) */
     UFUNCTION(BlueprintPure, Category = "LightProbe")
     FLinearColor GetCurrentColor() const { return CorrectedOutputColor; }
+
+    /** 上方向の色を取得 */
+    UFUNCTION(BlueprintPure, Category = "LightProbe")
+    FLinearColor GetTopColor() const { return CurrentTopColor; }
+
+    /** 横方向の色を取得 */
+    UFUNCTION(BlueprintPure, Category = "LightProbe")
+    FLinearColor GetSideColor() const { return CurrentSideColor; }
+
+    /** 最も明るい光源の色を取得 */
+    UFUNCTION(BlueprintPure, Category = "LightProbe")
+    FLinearColor GetDominantColor() const { return CurrentDominantColor; }
+
+    /** 指定したソースの色を取得 */
+    UFUNCTION(BlueprintPure, Category = "LightProbe")
+    FLinearColor GetColorBySource(ELightProbeColorSource Source) const;
 
     /** プローブ名を取得 */
     UFUNCTION(BlueprintPure, Category = "LightProbe")
@@ -173,6 +230,9 @@ private:
 
     /** 色補正を適用 */
     FLinearColor ApplyColorCorrection(const FLinearColor &RawColor) const;
+
+    /** 色のみモードを適用 */
+    FLinearColor ApplyColorOnlyMode(const FLinearColor &InputColor) const;
 
     /** 色温度をRGB変換 */
     static FLinearColor ColorTemperatureToRGB(float TempKelvin);

@@ -105,7 +105,7 @@ void ALightProbeActor::EnsureCaptureInitialized()
     if (!bCaptureInitialized)
     {
         InitializeCapture();
-        bCaptureInitialized = (CaptureRenderTarget != nullptr);
+        bCaptureInitialized = (CaptureRenderTarget != nullptr && CaptureRenderTarget->GetResource() != nullptr);
     }
 }
 
@@ -194,42 +194,78 @@ void ALightProbeActor::ForceSampleOnce()
     if (ColorSampler)
     {
         ColorSampler->SampleFromRenderTarget(CaptureRenderTarget);
+        
+        // 全方向の色を取得
         CurrentSampledColor = ColorSampler->GetSampledColor();
+        CurrentTopColor = ColorSampler->GetTopColor();
+        CurrentSideColor = ColorSampler->GetSideColor();
+        CurrentDominantColor = ColorSampler->GetDominantColor();
     }
 
-    // 3) 色補正を適用
+    // 3) 色補正を適用 (全体平均)
     CorrectedOutputColor = ApplyColorCorrection(CurrentSampledColor);
 
-    // 4) 色のみモード: 明度を正規化して色相・彩度のみ送信
-    FLinearColor OutputColor = CorrectedOutputColor;
-    if (bColorOnly)
-    {
-        const float MaxComp = FMath::Max3(OutputColor.R, OutputColor.G, OutputColor.B);
-        if (MaxComp > ColorOnlyBlackThreshold)
-        {
-            // max(R,G,B) = 1.0 に正規化 → 純粋な色だけ
-            OutputColor.R /= MaxComp;
-            OutputColor.G /= MaxComp;
-            OutputColor.B /= MaxComp;
-        }
-        else
-        {
-            // 暗すぎる場合はブラックを送信
-            OutputColor = FLinearColor::Black;
-        }
-    }
+    // 4) DMX出力用の色を取得
+    FLinearColor DMXOutputColor = ApplyColorCorrection(GetColorBySource(DMXColorSource));
+    DMXOutputColor = ApplyColorOnlyMode(DMXOutputColor);
 
-    // 5) DMX出力に色を渡す
+    // 5) OSC出力用の色を取得
+    FLinearColor OSCOutputColor = ApplyColorCorrection(GetColorBySource(OSCColorSource));
+    OSCOutputColor = ApplyColorOnlyMode(OSCOutputColor);
+
+    // 6) DMX出力に色を渡す
     if (bUseDMXOutput && DMXOutput)
     {
-        DMXOutput->SendColor(OutputColor);
+        DMXOutput->SendColor(DMXOutputColor);
     }
 
-    // 6) OSC出力に色を渡す (別PCへのネットワーク送信)
+    // 7) OSC出力に色を渡す (別PCへのネットワーク送信)
     if (bUseOSCOutput && OSCOutput)
     {
-        OSCOutput->SendColor(OutputColor);
+        OSCOutput->SendColor(OSCOutputColor);
     }
+}
+
+FLinearColor ALightProbeActor::GetColorBySource(ELightProbeColorSource Source) const
+{
+    switch (Source)
+    {
+    case ELightProbeColorSource::Top:
+        return CurrentTopColor;
+    case ELightProbeColorSource::Side:
+        return CurrentSideColor;
+    case ELightProbeColorSource::Dominant:
+        return CurrentDominantColor;
+    case ELightProbeColorSource::Average:
+    default:
+        return CurrentSampledColor;
+    }
+}
+
+FLinearColor ALightProbeActor::ApplyColorOnlyMode(const FLinearColor& InputColor) const
+{
+    if (!bColorOnly)
+    {
+        return InputColor;
+    }
+
+    FLinearColor OutputColor = InputColor;
+    const float MaxComp = FMath::Max3(OutputColor.R, OutputColor.G, OutputColor.B);
+    
+    if (MaxComp > ColorOnlyBlackThreshold)
+    {
+        // max(R,G,B) = 1.0 に正規化 → 純粋な色だけ
+        OutputColor.R /= MaxComp;
+        OutputColor.G /= MaxComp;
+        OutputColor.B /= MaxComp;
+    }
+    else
+    {
+        // 暗すぎる場合はブラックを送信
+        OutputColor = FLinearColor::Black;
+    }
+    
+    return OutputColor;
 }
 
 void ALightProbeActor::InitializeCapture()
@@ -252,8 +288,23 @@ void ALightProbeActor::UpdateRenderTarget()
 
     // CubeMapレンダーターゲットを作成
     CaptureRenderTarget = NewObject<UTextureRenderTargetCube>(this, TEXT("CaptureRT"));
+    if (!CaptureRenderTarget)
+    {
+        UE_LOG(LogLightSyncDMX, Error,
+               TEXT("LightProbe '%s': レンダーターゲットの生成に失敗しました"), *ProbeName);
+        return;
+    }
+
     CaptureRenderTarget->Init(CaptureResolution, PF_FloatRGBA);
     CaptureRenderTarget->UpdateResourceImmediate(true);
+
+    if (!CaptureRenderTarget->GetResource())
+    {
+        UE_LOG(LogLightSyncDMX, Error,
+               TEXT("LightProbe '%s': レンダーターゲットのGPUリソース初期化に失敗しました"), *ProbeName);
+        CaptureRenderTarget = nullptr;
+        return;
+    }
 
     if (SceneCapture)
     {
