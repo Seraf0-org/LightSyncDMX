@@ -121,7 +121,7 @@ struct LIGHTSYNCDMX_API FLightSyncZoneResult
 namespace LightSyncZones
 {
     /** シェーダーと共有する最大ゾーン数 */
-    static constexpr int32 MaxZones = 8;
+    static constexpr int32 MaxZones = 16;
 
     /** GPU / CPU 積分器に渡すゾーン (ワールド空間) */
     struct FZoneDesc

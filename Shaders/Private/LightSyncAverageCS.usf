@@ -24,13 +24,13 @@
 // 出力バッファ (float4):
 //   [0..5]       : 面ごとのピーク (dir.xyz, 平均輝度)
 //   [6]          : 重心の合計 (Σ lum·dir·dΩ, Σ lum·dΩ)
-//   [8..15]      : ゾーンの合計 (Σ L·m·g·dΩ の rgb, Σ m·dΩ)      ← CPU に読み戻すのはここまで
-//   [16..]       : 重心の部分和 (グループごと)
-//   [16+384..]   : ゾーンの部分和 (グループごと × MAX_ZONES)
+//   [8..23]      : ゾーンの合計 (Σ L·m·g·dΩ の rgb, Σ m·dΩ)      ← CPU に読み戻すのはここまで
+//   [24..]       : 重心の部分和 (グループごと)
+//   [24+384..]   : ゾーンの部分和 (グループごと × MAX_ZONES)
 
 #include "/Engine/Public/Platform.ush"
 
-#define MAX_ZONES 8
+#define MAX_ZONES 16
 #define THREADS_X 16
 #define THREADS_Y 16
 #define NUM_THREADS (THREADS_X * THREADS_Y)
@@ -83,8 +83,8 @@ float KeyRefineCos;
 #define REFINE_TOTAL 6u
 #define ZONES_TOTAL 8u
 #define MAX_GROUPS (6u * 8u * 8u)
-#define REFINE_PARTIALS 16u
-#define ZONE_PARTIALS (16u + MAX_GROUPS)
+#define REFINE_PARTIALS (ZONES_TOTAL + MAX_ZONES)
+#define ZONE_PARTIALS (REFINE_PARTIALS + MAX_GROUPS)
 
 groupshared float4 gs_Reduce[NUM_THREADS];
 
@@ -460,6 +460,7 @@ void MainZonesCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThrea
 
     // ゾーンごとにグループ内で合計して部分和として書き出す
     const uint groupLinear = GroupLinear(GroupId);
+    // ループの回数は定数にする (バリアを含むので、コンパイラが一様と判断できる形にする)。使わないゾーンは 0 の和
     for (uint z3 = 0; z3 < MAX_ZONES; ++z3)
     {
         float4 sum = GroupSum(GroupIndex, acc[z3]);
@@ -474,7 +475,7 @@ void MainZonesCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThrea
 void MainZonesReduceCS(uint GroupIndex : SV_GroupIndex)
 {
     const uint count = 6u * GroupsPerSide * GroupsPerSide;
-    for (uint z = 0; z < MAX_ZONES; ++z)
+    for (uint z = 0; z < NumZones; ++z)
     {
         float4 acc = 0.0f;
         for (uint i = GroupIndex; i < count; i += NUM_THREADS)

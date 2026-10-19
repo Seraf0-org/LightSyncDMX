@@ -26,6 +26,13 @@ enum class ELightSyncColorMode : uint8
     CCT UMETA(DisplayName = "CCT+Brightness (2ch)"),
     /** 10ch: CCT/GreenMagenta/Dimmer/Crossfade/R/G/B/W/Strobe/Reserved (RGBW モードで使用) */
     CCTRGBW10CH UMETA(DisplayName = "CCT & RGBW (10ch)"),
+    /**
+     * Nanlite PavoSlim (60C/120C/240C など) の DMX モード「CCT & RGBW 8bit」(11ch):
+     * Dimmer / CCT / G-M / Crossfade / R / G / B / W / Strobe / Reserved / Reserved。
+     * Crossfade = 255 (RGBW のみ)、G-M = 132 (ニュートラル)、Strobe = 0 (OFF) を固定で送る。
+     * 本体の "DMX Reduced Channels" が ON の場合は末尾 3ch が無くなるので、プロファイルアセットで削る
+     */
+    NanlitePavoSlimRGBW11CH UMETA(DisplayName = "Nanlite PavoSlim CCT & RGBW 8bit (11ch)"),
 };
 
 /** 灯体の色の作り方 */

@@ -195,6 +195,32 @@ bool FLightSyncFixtureBlackoutTest::RunTest(const FString &Parameters)
     return true;
 }
 
+LS_FIXTURE_TEST(FLightSyncFixtureNanliteTest, "NanlitePavoSlimLayout")
+bool FLightSyncFixtureNanliteTest::RunTest(const FString &Parameters)
+{
+    // Nanlite PavoSlim「CCT & RGBW 8bit」: Dimmer / CCT / G-M / Crossfade / R / G / B / W / Strobe / Reserved / Reserved
+    const FLightSyncFixtureProfileData P = LightSyncFixture::MakePreset(ELightSyncColorMode::NanlitePavoSlimRGBW11CH);
+    TestEqual(TEXT("11 channels"), P.GetChannelCount(), 11);
+
+    const FLightSyncFixtureOutput O = LightSyncFixture::Compute(P, FLinearColor(0.5f, 0.0f, 0.0f), Identity, 1.0);
+    if (TestEqual(TEXT("11 values"), O.Values.Num(), 11))
+    {
+        TestEqual(TEXT("ch1 Dimmer = 0.5"), O.Values[0], Byte(0.5));
+        TestEqual(TEXT("ch3 G/M neutral"), O.Values[2], static_cast<uint8>(132));
+        TestEqual(TEXT("ch4 Crossfade RGBW"), O.Values[3], static_cast<uint8>(255));
+        TestEqual(TEXT("ch5 R full (ratio)"), O.Values[4], static_cast<uint8>(255));
+        TestEqual(TEXT("ch6 G off"), O.Values[5], static_cast<uint8>(0));
+        TestEqual(TEXT("ch8 W off for pure red"), O.Values[7], static_cast<uint8>(0));
+        TestEqual(TEXT("ch9 Strobe off"), O.Values[8], static_cast<uint8>(0));
+    }
+
+    // 消灯でもモード切替 (Crossfade) と G/M は保つ
+    const FLightSyncFixtureOutput B = LightSyncFixture::ComputeBlackout(P);
+    const TArray<uint8> Expected = {0, 0, 132, 255, 0, 0, 0, 0, 0, 0, 0};
+    TestEqual(FString::Printf(TEXT("blackout %s"), *Join(B.Values)), B.Values, Expected);
+    return true;
+}
+
 #undef LS_FIXTURE_TEST
 
 #endif // WITH_DEV_AUTOMATION_TESTS

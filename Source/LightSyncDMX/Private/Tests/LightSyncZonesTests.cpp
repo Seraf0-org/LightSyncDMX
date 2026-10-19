@@ -323,4 +323,66 @@ bool FLightSyncZonesHDRTransferTest::RunTest(const FString &Parameters)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLightSyncZonesStageLayoutTest, "LightSync.Zones.TenFixtureStageLayout",
+                                 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::EngineFilter)
+bool FLightSyncZonesStageLayoutTest::RunTest(const FString &Parameters)
+{
+    // 例: 正面に LED ウォール、天井 3x2 (頭上 +1.0m)、左右のサイドに 2 灯ずつ (頭の高さ -0.2m)。
+    // 方向 = 灯体の位置 - プローブ (被写体の頭) の位置 [m]。X = 壁の方向、Y = 右、Z = 上
+    struct FFixture { const TCHAR *Name; FVector Dir; };
+    const FFixture Fixtures[] = {
+        {TEXT("C_FrontLeft"), FVector(0.5, -1.2, 1.0)}, {TEXT("C_FrontCenter"), FVector(0.5, 0.0, 1.0)}, {TEXT("C_FrontRight"), FVector(0.5, 1.2, 1.0)},
+        {TEXT("C_BackLeft"), FVector(-0.5, -1.2, 1.0)}, {TEXT("C_BackCenter"), FVector(-0.5, 0.0, 1.0)}, {TEXT("C_BackRight"), FVector(-0.5, 1.2, 1.0)},
+        {TEXT("S_LeftFront"), FVector(1.0, -2.5, -0.2)}, {TEXT("S_LeftBack"), FVector(-0.5, -2.5, -0.2)},
+        {TEXT("S_RightFront"), FVector(1.0, 2.5, -0.2)}, {TEXT("S_RightBack"), FVector(-0.5, 2.5, -0.2)},
+    };
+    const int32 NumFixtures = UE_ARRAY_COUNT(Fixtures);
+
+    TArray<FLightSyncZone> Zones;
+    Zones.Add(MakeZone("Wall", ELightSyncZoneShape::Exclude, FVector(1.0, 0.0, 0.1), false, 40.0f, 8.0f));
+    for (const FFixture &F : Fixtures)
+    {
+        Zones.Add(MakeZone(F.Name, ELightSyncZoneShape::Irradiance, F.Dir, true));
+    }
+    TestEqual(TEXT("11 zones fit"), Zones.Num(), 11);
+
+    // 各灯体の方向に小さな明るい光源 → その灯体のゾーンが最大になる
+    const float SpotCos = FMath::Cos(FMath::DegreesToRadians(8.0f));
+    for (int32 Target = 0; Target < NumFixtures; ++Target)
+    {
+        const FVector3f SpotDir = FVector3f(Fixtures[Target].Dir.GetSafeNormal());
+        TArray<FLinearColor> Faces[6];
+        MakeCube(Faces, [&](const FVector3f &Dir) { return FVector3f::DotProduct(Dir, SpotDir) > SpotCos ? FLinearColor(10.0f, 10.0f, 10.0f) : FLinearColor::Black; });
+        const LightSyncZones::FResult R = Run(Faces, Zones);
+        TestEqual(TEXT("result zones (Exclude も値 0 として並ぶ)"), R.Zones.Num(), 11);
+
+        int32 Best = INDEX_NONE;
+        float BestValue = 0.0f;
+        for (int32 Z = 1; Z < R.Zones.Num(); ++Z)
+        {
+            if (R.Zones[Z].X > BestValue)
+            {
+                BestValue = R.Zones[Z].X;
+                Best = Z;
+            }
+        }
+        TestEqual(FString::Printf(TEXT("light from %s -> zone"), Fixtures[Target].Name), Best, Target + 1);
+    }
+
+    // 壁の方向の光は、どのゾーンにも入らない (現場では壁が本物の光として当たっているので、灯体で足さない)
+    {
+        const FVector3f WallDir = FVector3f(1.0f, 0.0f, 0.1f).GetSafeNormal();
+        TArray<FLinearColor> Faces[6];
+        MakeCube(Faces, [&](const FVector3f &Dir) { return FVector3f::DotProduct(Dir, WallDir) > FMath::Cos(FMath::DegreesToRadians(20.0f)) ? FLinearColor(10.0f, 10.0f, 10.0f) : FLinearColor::Black; });
+        const LightSyncZones::FResult R = Run(Faces, Zones);
+        float Total = 0.0f;
+        for (int32 Z = 1; Z < R.Zones.Num(); ++Z)
+        {
+            Total += R.Zones[Z].X;
+        }
+        TestTrue(FString::Printf(TEXT("wall light excluded (Σ = %.6f)"), Total), Total < 1e-4f);
+    }
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

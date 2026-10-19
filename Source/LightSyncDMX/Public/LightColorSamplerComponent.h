@@ -78,7 +78,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sampling")
     bool bSamplingEnabled = true;
 
-    /** ゾーン (最大 8 個まで有効)。出力側は Name で参照する */
+    /** ゾーン (最大 16 個まで有効)。出力側は Name で参照する */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sampling|Zones", meta = (TitleProperty = "Name"))
     TArray<FLightSyncZone> Zones;
 

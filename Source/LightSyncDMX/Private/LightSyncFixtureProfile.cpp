@@ -158,6 +158,23 @@ namespace LightSyncFixture
                           MakeChannel(TEXT("Strobe"), F::Fixed, 0, 0),
                           MakeChannel(TEXT("Reserved"), F::Fixed, 0, 0)};
             break;
+
+        case ELightSyncColorMode::NanlitePavoSlimRGBW11CH:
+            // Nanlite PavoSlim DMX REFERENCE GUIDE「CCT & RGBW 8bit」。RGBW のみで使う (Crossfade 255)
+            AddRGB();
+            P.Emitters.Add(MakeEmitter(TEXT("W"), White, true));
+            P.CCTMinKelvin = 2700.0f;
+            P.CCTMaxKelvin = 7500.0f;
+            P.Channels = {MakeChannel(TEXT("Dimmer"), F::Dimmer),
+                          MakeChannel(TEXT("CCT"), F::Fixed, 0, 0),
+                          MakeChannel(TEXT("GreenMagenta"), F::Fixed, 0, 132),   // 120-145 = ニュートラル
+                          MakeChannel(TEXT("Crossfade"), F::Fixed, 0, 255),      // 255 = RGBW のみ
+                          MakeChannel(TEXT("R"), F::Emitter, 0), MakeChannel(TEXT("G"), F::Emitter, 1),
+                          MakeChannel(TEXT("B"), F::Emitter, 2), MakeChannel(TEXT("W"), F::Emitter, 3),
+                          MakeChannel(TEXT("Strobe"), F::Fixed, 0, 0),           // 0-3 = OFF
+                          MakeChannel(TEXT("Reserved"), F::Fixed, 0, 0),
+                          MakeChannel(TEXT("Reserved"), F::Fixed, 0, 0)};
+            break;
         }
         return P;
     }
@@ -167,7 +184,7 @@ namespace LightSyncFixture
         static const TArray<FLightSyncFixtureProfileData> Presets = []()
         {
             TArray<FLightSyncFixtureProfileData> All;
-            for (int32 Index = 0; Index <= static_cast<int32>(ELightSyncColorMode::CCTRGBW10CH); ++Index)
+            for (int32 Index = 0; Index <= static_cast<int32>(ELightSyncColorMode::NanlitePavoSlimRGBW11CH); ++Index)
             {
                 All.Add(MakePreset(static_cast<ELightSyncColorMode>(Index)));
             }

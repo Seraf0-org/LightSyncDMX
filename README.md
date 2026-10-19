@@ -111,7 +111,7 @@
 
 ## ゾーン
 
-プローブの **Color Sampler → Zones** で、「どの方向の光を、どの灯体で再現するか」を決めます (最大 8 個)。
+プローブの **Color Sampler → Zones** で、「どの方向の光を、どの灯体で再現するか」を決めます (最大 16 個)。
 DMX のフィクスチャと OSC のターゲットは、ゾーンを **名前** で参照します。
 
 ### 形状
@@ -128,7 +128,7 @@ DMX のフィクスチャと OSC のターゲットは、ゾーンを **名前**
 | **Exclude** | 出力しない。そのコーンの方向を **全ゾーンから除外** | LED ウォール自体が照らす方向 (壁の光は壁が出すので灯体で足さない) |
 
 - **Share Directions**: Irradiance / Ring / Cone は方向を分け合い、同じ光を二重に数えません。境界の鋭さは `Partition Sharpness` で調整します (大きいほど「一番近いゾーンが全部持つ」に近づく)
-- 方向はプローブのローカル空間です。プローブを回すとゾーンも回ります
+- 方向はプローブのローカル空間です (UE の軸: **X = 前、Y = 右、Z = 上**)。プローブを回すとゾーンも回ります。長さは関係ない (自動で正規化) ので、「灯体の位置 − プローブの位置」をそのまま入れてよい
 - Key は「ブロック単位で最も明るい方向 → そのコーン内の輝度重心」の 2 段で方向を決めます (テストでの誤差 0°)
 
 ### 既定のゾーン
@@ -145,10 +145,37 @@ DMX のフィクスチャと OSC のターゲットは、ゾーンを **名前**
 ```
 Wall    Exclude    Direction = ウォールの方向 (例 +X)、Cone 70°    ← 壁の光は数えない
 Top     Irradiance Direction = +Z (分割)                            → 天井の PavoTube
-Left    Cone       Direction = +Y、Cone 60° (分割)                  → 左の灯体
-Right   Cone       Direction = −Y、Cone 60° (分割)                  → 右の灯体
+Left    Cone       Direction = −Y、Cone 60° (分割)                  → 左の灯体
+Right   Cone       Direction = +Y、Cone 60° (分割)                  → 右の灯体
 Back    Irradiance Direction = −X (分割)                            → 逆光
 ```
+
+### 設計例: 天井 3×2 + 左右のサイド 2 灯ずつ (10 灯)
+
+灯体 1 台に 1 ゾーンを割り当て、全部 **Irradiance + Share Directions**、壁の方向は **Exclude** にします (11 ゾーン)。
+Direction は「灯体の位置 − プローブ (被写体の頭) の位置」です。下は、頭の高さ 1.5 m、天井の灯体 2.5 m、サイドの灯体の中心 1.3 m とした例 (単位 m、X = 壁の方向、Y = 右)。水平の位置は現場で測って置き換えてください。
+
+```
+        WWWWWW (LED ウォール)               X
+                                            ↑
+ S_LF                        S_RF           └→ Y
+        C_FL   C_FC   C_FR
+ S_LB   C_BL   C_BC   C_BR   S_RB
+          (被写体はこの付近)
+```
+
+| ゾーン | 形状 | Direction (X, Y, Z) | 灯体 |
+|--------|------|---------------------|------|
+| `Wall` | Exclude (Cone = 壁が見える範囲、例 40°) | (1, 0, 0.1) | なし |
+| `C_FL` / `C_FC` / `C_FR` | Irradiance (分割) | (0.5, −1.2, 1.0) / (0.5, 0, 1.0) / (0.5, 1.2, 1.0) | 天井・前列 |
+| `C_BL` / `C_BC` / `C_BR` | Irradiance (分割) | (−0.5, −1.2, 1.0) / (−0.5, 0, 1.0) / (−0.5, 1.2, 1.0) | 天井・後列 |
+| `S_LF` / `S_LB` | Irradiance (分割) | (1.0, −2.5, −0.2) / (−0.5, −2.5, −0.2) | 左サイド |
+| `S_RF` / `S_RB` | Irradiance (分割) | (1.0, 2.5, −0.2) / (−0.5, 2.5, −0.2) | 右サイド |
+
+- この構成は自動テスト `LightSync.Zones.TenFixtureStageLayout` で確認しています (各灯体の方向の光 → その灯体のゾーンが最大、壁の方向の光 → どのゾーンにも入らない)
+- 隣り合う灯体どうしは光を分け合います (境界はなめらか)。分け方を鋭くしたいときは `Partition Sharpness` を上げる (既定 4、8〜16 で「一番近い灯体が持つ」に近づく)。柔らかいパネル灯体なら既定で十分
+- 天井の灯体は頭から 1 m ほどしか離れていないので、被写体が動くと方向が大きく変わります。プローブは被写体の立ち位置の中心に置く
+- 強さは灯体ごとのキャリブレーション (被写体の位置で測る) に距離と向きが含まれるので、同じ機種でも **灯体ごとにプロファイル** を作る
 
 ---
 
@@ -176,6 +203,7 @@ Back    Irradiance Direction = −X (分割)                            → 逆�
 | Dimmer+RGB (4ch) | Dimmer, R, G, B | Dimmer = 明るさ、RGB = 混色比 |
 | CCT+Brightness (2ch) | CCT, Dimmer | 2700–6500K |
 | CCT & RGBW (10ch) | CCT, G/M, Dimmer, Crossfade, R, G, B, W, Strobe, Reserved | RGBW モード (Crossfade = 255) で使う。2700–7500K |
+| Nanlite PavoSlim CCT & RGBW 8bit (11ch) | Dimmer, CCT, G/M, Crossfade, R, G, B, W, Strobe, Reserved, Reserved | Nanlite PavoSlim 60C / 120C / 240C の DMX モード「CCT & RGBW 8bit」。Crossfade 255 (RGBW のみ)、G/M 132 (ニュートラル)、Strobe 0 を固定で送る。本体の "DMX Reduced Channels" が ON なら末尾 3ch を削ったプロファイルを使う |
 
 ### 灯体プロファイル (ULightSyncFixtureProfile)
 
@@ -538,7 +566,7 @@ LightSync.ValidateGPU
 - **OCIO**: 内側フラスタム (ICVFX カメラ) とライトカードの OCIO は使いません。照明の基準は外側ビューポート (壁の環境) です
 - 内蔵プリセットのアンバーは近似値です。RGBAW 灯体はキャリブレーションしてください
 - **PIE 中** は、エディタワールド側のプローブは送信しません (二重送信を防ぐため)
-- 最大ゾーン数は 8 です
+- 最大ゾーン数は 16 です
 
 ---
 
@@ -642,6 +670,8 @@ LightSyncDMX/
 - **Scene Light モードの露出を修正**: 2.0 は UE の手動露出に 0.18 を余計に掛けていました (0.18 を掛けるのは自動露出のときだけ)。同じ露出設定で、Scene Light モードの値は 2.0 の約 5.6 倍 (= 1 / 0.18) になり、LED Wall モードと同じ尺度になります。2.0 で `Manual Exposure Bias` を +2.47 (= log2(1/0.18)) などで補っていた場合は、その分を戻してください
 - OCIO (PQ / 任意ガンマ / 表示の色域) に対応
 - 変化がないときは更新を減らす (既定オフ)
+- ゾーンの上限を 8 → 16 に (10 灯 + 壁の除外を 1 プローブで)
+- 内蔵プリセットに Nanlite PavoSlim「CCT & RGBW 8bit」(11ch) を追加
 
 ## 1.x からの移行
 
