@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
-	"VersionName": "1.1",
+	"Version": 3,
+	"VersionName": "2.0",
 	"FriendlyName": "LightSync DMX",
-	"Description": "VP用 - UEシーンの光色をサンプリングしDMX/OSC信号として送信。LEDウォール/照明の色をリアルタイムに同期。別PCのQLC+/DasLight連携対応。",
+	"Description": "VP用 - プローブ位置の光を立体角で正しくゾーン積分し、灯体プロファイルとソルバでカメラ上の色を一致させて DMX/OSC 出力。LEDウォール基準/シーン基準、カメラだけのキャリブレーション、nDisplay のグレーディング連携に対応。",
 	"Category": "Virtual Production",
 	"CreatedBy": "UE-Comp",
 	"CreatedByURL": "",

@@ -1,338 +1,384 @@
-# LightSync DMX - Unreal Engine VP Light Synchronization Plugin
+# LightSync DMX 2.0
 
-## 概要
+バーチャルプロダクション (VP) で、**実際の照明を、LEDウォール (または仮想シーン) の光と同じ色・同じ強さの比率で光らせる** Unreal Engine 5.7 プラグインです。
 
-**LightSync DMX** は、Unreal Engine のバーチャルプロダクション (VP) において、
-UEシーン内の光の色味と実際のLED照明の色を一致させるためのプラグインです。
+被写体の位置にプローブを置くと、周囲 360° の光を方向ごとに測り、灯体ごとに DMX (Art-Net / sACN) または OSC で送ります。
+2.0 では色の計算を作り直し、物理量と実測値で一貫するようにしました。
 
-### 問題
-VP撮影時、UEのバーチャル背景から放たれる光と、スタジオのLED照明の色味が一致しないため、
-被写体への照明が不自然になる。
-
-### 解決策
-シーン内に「光を吸収するプローブ」を配置し、その位置での周囲光の平均色を
-リアルタイムでサンプリング → DMX信号として送信 → 実際のLED照明に反映。
+- 光の量は **立体角で正しく重み付けした照度** で測る (方向ごとの「ゾーン」)
+- 色の基準を **LEDウォールの表示色** と **シーンの物理的な光** から選べる
+- 灯体の色は **カメラ上で一致するように** ソルバで解く (RGB / RGBW / RGBAW / CCT など、16bit 対応)
+- **カメラだけ** で灯体と壁をキャリブレーションできる
+- **nDisplay** の外側ビューポートと同じ露出・カラーグレーディングを使える
 
 ---
 
-## アーキテクチャ
+## 目次
+
+1. [仕組み](#仕組み)
+2. [クイックスタート](#クイックスタート)
+3. [色の基準](#色の基準)
+4. [ゾーン](#ゾーン)
+5. [灯体と DMX 出力](#灯体と-dmx-出力)
+6. [OSC 出力](#osc-出力)
+7. [キャリブレーション (カメラ)](#キャリブレーション-カメラ)
+8. [nDisplay 連携](#ndisplay-連携)
+9. [モニターウィンドウ](#モニターウィンドウ)
+10. [Blueprint / Python](#blueprint--python)
+11. [検証と診断](#検証と診断)
+12. [制約と注意点](#制約と注意点)
+13. [トラブルシューティング](#トラブルシューティング)
+14. [インストールとビルド](#インストールとビルド)
+15. [1.x からの移行](#1x-からの移行)
+
+---
+
+## 仕組み
 
 ```
-UEシーンの光源
-      ↓
-┌─────────────────────────┐
-│    LightProbeActor      │   ← シーンに配置する光プローブ
-│  ┌───────────────────┐  │
-│  │ SceneCaptureCube  │  │   ← 360°キャプチャ
-│  └─────────┬─────────┘  │
-│            ↓            │
-│  ┌───────────────────┐  │
-│  │ LightColorSampler │  │   ← 平均色を算出
-│  └─────────┬─────────┘  │
-│            ↓            │
-│  ┌───────────────────┐  │
-│  │ Output Selection  │  │
-│  └──────┬──────┬─────┘  │
-│         ↓      ↓        │
-│  ┌─────────┐ ┌─────────┐│
-│  │ DMX Out │ │ OSC Out ││
-│  └─────────┘ └─────────┘│
-└─────────────────────────┘
-      ↓ (Art-Net / sACN)       ↓ (OSC over Network)
-   LED照明器具           別PC (QLC+ / DasLight)
-                              ↓ (DMX変換)
-                           LED照明器具
+ LightProbeActor (被写体の位置)
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │ ① キューブキャプチャ                                                 │
+ │    Wall : 露出・グレーディング・トーンカーブ後の値 (= 壁へ送る信号)  │
+ │           → 画素ごとに壁の表示特性 (sRGB 等) で光に戻す             │
+ │    Scene: トーンマップ前の放射輝度 × 露出                             │
+ │                    ↓                                                 │
+ │ ② ゾーンごとに積分 (GPU Compute、立体角で重み付け)                   │
+ │    → 正規化照度 T (リニア RGB、1.0 = 基準白の一様な環境から受ける照度) │
+ │                    ↓                                                 │
+ │ ③ 時定数でスムージング (フレームレートに依存しない)                  │
+ └────────────────────┬────────────────────────────────────────────────┘
+                      ↓
+ ④ 灯体ごとにソルバで解く (カメラ空間で一致させる)
+      M_fix · d = M_ref · (ゲイン × T)
+        M_ref : 基準 → カメラ (ステージキャリブレーション)
+        M_fix : 灯体のエミッタ → カメラ (灯体プロファイル)
+      → 色域外は色相を保って彩度を下げ、上限超えは等倍で下げる
+      → 調光カーブの逆 → 8 / 16bit
+                      ↓
+ ⑤ DMX (Art-Net / sACN) / OSC で送信
 ```
 
-### 2つの出力パス
-
-| パス | ユースケース |
-|------|-------------|
-| **DMX直接** | UEのPCにDMXインターフェースが接続されている場合 |
-| **OSC経由** | UEのPCとDMX制御PCが別マシンの場合 (QLC+, DasLight等) |
+キャリブレーションしなくても動きます。その場合は M_ref と M_fix を理想値 (カメラ = Rec.709、エミッタ = 純色) として扱います。
 
 ---
 
-## コンポーネント一覧
+## クイックスタート
 
-### LightProbeActor
-- シーンに配置するメインのActor
-- `SceneCaptureComponentCube` で360°の環境光をキャプチャ
-- 色補正機能 (ガンマ、色温度、彩度、明度)
-- **方向別カラー出力**: Average / Top / Side / Dominant から選択可能
-- エディタ上で視覚的にプローブ位置を確認可能
-- 無効化・削除時に出力先へブラックアウトを送信 (`Blackout When Inactive`、オフにすると最後の色を保持)
-- PIE 実行中はエディタ側のプローブが送信を止め、PIE 側だけが送信する (二重送信によるちらつき防止)
-
-### LightColorSamplerComponent
-- CubeMapレンダーターゲットからピクセルデータを読み取り
-- **輝度加重平均**: 明るい光源の影響を強く反映
-- **方向別カラー**: Top (天井) / Side (側面) / Dominant (最も明るい) を個別に算出
-- サンプリング方式: GPU Compute (高速) / CPU Sync (フォールバック)
-- EMA (指数移動平均) によるスムージングでちらつきを抑制
-- HDRクランプと暗部閾値による精度向上
-
-### DMXColorOutputComponent
-- UE DMXProtocol プラグインを使用してArt-Net / sACN で送信
-- 複数のフィクスチャへの同時出力対応
-- カラーモード: RGB, RGBW, RGBAW, Dimmer+RGB, CCT+Brightness, CCT & RGBW (10ch)
-- フィクスチャ毎の個別ブライトネス調整
-- **DMX Library** を指定するとそのライブラリの Output Ports にだけ送信 (未指定なら Project Settings の全出力ポート)
-- 開始チャンネル + 使用ch数 が 512 を超えるマッピングは送信せず警告 (モニターでも赤表示)
-
-### OSCColorOutputComponent (★ 別PC連携)
-- **ネットワーク経由** で別PCの照明ソフトに色データを送信
-- QLC+ 互換モード: `/lightsync/{probe}/r`, `/lightsync/{probe}/g`, `/lightsync/{probe}/b` [int 0-255]
-- DasLight 互換モード: `/dmx/{universe}/{channel}` [int 0-255]
-- 汎用 Float RGB / Int RGB255 / RGBA / カスタムアドレス
-- 複数ターゲットへの同時送信対応 (異なるPCに同時送信可)
-- バンドルメッセージ対応 (R/G/Bを1パケットにまとめて送信)
-- 送信先 (IP / Port) を Details やモニターで変更すると自動で再接続
-- マスターディマー対応 (Blackout には影響しない)
-
-### LightSyncSubsystem
-- ワールド内の全プローブを一括管理
-- マスターディマー (DMX / OSC 両方に適用)、一括ON/OFF、ブラックアウト
-- `bDrawDebug`: 各プローブ位置に出力色の球と名前を描画
-- Blueprint/C++ から統一的にアクセス可能
-
-### LightSyncDMXEditor (Editor Module)
-- **LightSync DMX Monitor** ウィンドウ: Window → Virtual Production → LightSync DMX Monitor
-- リアルタイムでプローブ状態、色、DMXチャンネルを確認
-- **方向別カラープレビュー**: Average / Top / Side / Dominant を並列表示
-- マスターコントロール (一括有効/無効、ブラックアウト、ディマー、デバッグ表示)
-- モニターで変更した値はレベルの未保存変更になるので、Ctrl+S でレベルと一緒に保存される
+1. プラグインを有効にする (依存: DMX Protocol / DMX Engine / OSC。いずれも UE 同梱)
+2. **Project Settings → Plugins → DMX → Output Ports** に Art-Net / sACN の出力ポートを追加
+3. **Place Actors** で「Light Probe (DMX)」を検索し、被写体の位置に置く
+4. プローブの Details:
+   - **Reference Mode**: `LED Wall` (既定) か `Scene Light`
+   - **Reference Camera**: 撮影カメラ (ICVFX カメラや CineCameraActor)。露出は **Manual** にしておく
+   - **DMX Output → Fixture Mappings**: 灯体ごとに Universe / Start Channel / **Zone** / プリセット (または **Profile**)
+5. **Window → Virtual Production → LightSync DMX Monitor** で色と送信値を確認
+6. 色を本当に合わせたいときは [キャリブレーション](#キャリブレーション-カメラ) を行う
 
 ---
 
-## セットアップ手順
+## 色の基準
 
-### 1. プラグインの有効化
-1. UEプロジェクトの `Plugins` フォルダに本プラグインをコピー
-2. Edit → Plugins で以下を有効化:
-   - **LightSync DMX**
-   - **DMX Protocol** (依存プラグイン)
-   - **DMX Engine** (依存プラグイン)
-   - **OSC** (依存プラグイン - OSC出力使用時)
-3. エディタを再起動
+### Reference Mode
 
-### 2. DMX出力の設定 (同一PC構成の場合)
-1. Project Settings → Plugins → DMX Protocol で出力ポートを設定
-   - Art-Net の場合: IPアドレスとサブネットを設定
-   - sACN の場合: Universe範囲を設定
-2. DMX Library アセットを作成 (任意)
+| モード | 使う値 | 向いている場面 |
+|--------|--------|---------------|
+| **LED Wall** (既定) | 参照カメラと同じ露出・グレーディング・トーンカーブを通した値。壁へ送る信号そのもの (実測で LDR のコード値と一致) を、**画素ごとに** 壁の表示特性 (`Wall Display EOTF`: sRGB / ガンマ 2.2 / 2.4) で光に戻してから積分する | 壁と照明をカメラ上で揃えたい (通常はこちら) |
+| **Scene Light** | トーンマップ前の放射輝度に、UE の手動露出と同じ倍率 `0.18 × 2^(Bias − EV100)` を掛けた値 | 仮想シーンの光をそのまま再現したい。グレーディングの影響を受けたくない |
 
-### 2b. OSC出力の設定 (別PC構成の場合: QLC+ / DasLight)
-1. LightProbeActor の Details パネルで:
-   - **Use DMX Output** を `false` に (同一PCでDMXも送る場合はtrueのまま)
-   - **Use OSC Output** を `true` に
-2. OSC Output → Targets で送信先を設定:
-   - **IP Address**: QLC+ / DasLight が動作するPCのIPアドレス
-   - **Port**: QLC+ OSCプラグインのポート (デフォルト: 7700)
-   - **Format**: 照明ソフトに合わせたフォーマットを選択
+どちらも「カメラで 1.0 になる明るさ」を基準白にしているので、モードを切り替えても強さの尺度は同じです。
 
-#### QLC+ の場合
-- QLC+ の Input/Output Settings で OSC プラグインを有効化
-- Input ポートを本プラグインの送信ポートに合わせる
-- フォーマット: `QLC+ Compatible` を選択
-- OSCアドレスをQLC+のチャンネルにマッピング
+### ポストプロセスの取得元 (Post Process Source)
 
-#### DasLight の場合
-- DasLight の OSC 受信ポートを確認
-- フォーマット: `DasLight Compatible` を選択
-- Universe と Start Channel を DasLight の設定と一致させる
+| 取得元 | 内容 |
+|--------|------|
+| **Reference Camera / Manual** | 参照カメラの最終的なポストプロセス (CineCamera の絞り等を反映)。カメラが無ければ `Manual EV100` と `Manual Exposure Bias` |
+| **nDisplay Outer Viewport** | 上をシーンとして、nDisplay RootActor のカスタム PP とカラーグレーディングを重ねる ([nDisplay 連携](#ndisplay-連携)) |
 
-### 3. プローブの配置
-1. Place Actors パネルで "Light Probe (DMX)" を検索してレベルに配置
-2. プローブの Details パネルで設定:
-   - **Probe Name**: 識別名
-   - **Capture Resolution**: キャプチャ解像度 (64推奨)
-   - **Sampling Rate**: 更新レート (30Hz推奨)
+露出は常に **Manual** として扱います。キューブキャプチャが自分の中身に自動露出すると、壁と違う明るさになるためです。参照カメラが自動露出なら、ログに警告を一度出します。
 
-### 4. DMXマッピングの設定
-1. LightProbeActor → DMX Output → Fixture Mappings
-2. 各フィクスチャに対して:
-   - **Universe**: DMXユニバース番号
-   - **Start Channel**: 開始チャンネル
-   - **Color Mode**: 照明器具に合わせたモード
-   - **Brightness Scale**: 個別の明度調整
-   - **CCT Min / Max Kelvin**: CCT系モードで ch値 0 / 255 に対応する色温度 (灯体のマニュアルに合わせる)
-3. 特定のポートだけに送りたい場合は DMX Output → **DMX Library** にライブラリを指定
+色ではなく「像」にかかる効果 (ブルーム、フレア、ビネット、グレイン、DOF、モーションブラー、AA) は無効にしています。フォグや AO のように光の見え方に関わるものは有効のままです。
 
-### 5. 色補正
-1. LightProbeActor の Color セクション:
-   - **Gamma Correction**: 2.2 (sRGB標準)
-   - **Color Temperature Offset**: LED照明との色温度差を補正
-   - **Saturation Multiplier**: 彩度の調整
-   - **Brightness Multiplier**: 全体の明度調整
+### Output Gain
+
+全ゾーン共通のリニアなゲインです。灯体ごとの強さは、マッピングの **強さのゲイン** で調整します。
 
 ---
 
-## Blueprint からの使用
+## ゾーン
 
-### ユーティリティ関数
+プローブの **Color Sampler → Zones** で、「どの方向の光を、どの灯体で再現するか」を決めます (最大 8 個)。
+DMX のフィクスチャと OSC のターゲットは、ゾーンを **名前** で参照します。
+
+### 形状
+
+どの形状も、**一様な放射輝度 1 の環境で出力が 1.0** になるよう正規化してあります。
+
+| 形状 | 値 | 用途 |
+|------|----|------|
+| **Irradiance** | Direction を向いた面が受ける照度 (半球、コサイン重み) | 天井・正面・逆光など向きの決まった灯体 |
+| **Ring** | Direction を軸とした水平リング。軸に垂直な面の照度を全方位で平均 | 側面の灯体をまとめて 1 色で |
+| **Cone** | Direction 周りのコーンの照度 (境界はぼかし幅でなめらかに) | 狭い範囲だけを担当する灯体 |
+| **Sphere** | 全方位の平均放射輝度 | 全体の色 (アンビエント) |
+| **Key** | 最も明るい方向を自動で探し、その周りのコーンの照度 | スポット・太陽など動くキーライト |
+| **Exclude** | 出力しない。そのコーンの方向を **全ゾーンから除外** | LED ウォール自体が照らす方向 (壁の光は壁が出すので灯体で足さない) |
+
+- **Share Directions**: Irradiance / Ring / Cone は方向を分け合い、同じ光を二重に数えません。境界の鋭さは `Partition Sharpness` で調整します (大きいほど「一番近いゾーンが全部持つ」に近づく)
+- 方向はプローブのローカル空間です。プローブを回すとゾーンも回ります
+- Key は「ブロック単位で最も明るい方向 → そのコーン内の輝度重心」の 2 段で方向を決めます (テストでの誤差 0°)
+
+### 既定のゾーン
+
+| 名前 | 形状 | 役割 |
+|------|------|------|
+| `Top` | Irradiance (+Z、分割) | 天井 |
+| `Side` | Ring (Z 軸、分割) | 側面 |
+| `Average` | Sphere | 全体 |
+| `Key` | Key (20°) | キーライト |
+
+### 設計例: 正面に LED ウォール、天井と左右に灯体
+
 ```
-// 全プローブを取得
-LightSyncBPLibrary::GetAllLightProbes(WorldContext)
-
-// 一括制御
-LightSyncBPLibrary::SetAllProbesActive(WorldContext, true/false)
-LightSyncBPLibrary::BlackoutAllProbes(WorldContext)
-LightSyncBPLibrary::SetMasterDimmer(WorldContext, 0.8)
-
-// 色変換ユーティリティ
-LightSyncBPLibrary::LinearColorToDMXValues(Color, R, G, B)
-LightSyncBPLibrary::DMXValuesToLinearColor(R, G, B)
+Wall    Exclude    Direction = ウォールの方向 (例 +X)、Cone 70°    ← 壁の光は数えない
+Top     Irradiance Direction = +Z (分割)                            → 天井の PavoTube
+Left    Cone       Direction = +Y、Cone 60° (分割)                  → 左の灯体
+Right   Cone       Direction = −Y、Cone 60° (分割)                  → 右の灯体
+Back    Irradiance Direction = −X (分割)                            → 逆光
 ```
 
 ---
 
-## パフォーマンスノート
+## 灯体と DMX 出力
 
-| 設定 | 推奨値 | 備考 |
-|------|--------|------|
-| Sampling Method | GPU Compute | 高速・非同期、複数プローブでもスケール |
-| Capture Resolution | 64 | 色の平均なので低解像度で十分 |
-| Sampling Rate | 30 Hz | 映像と同期する場合はフレームレートに合わせる |
-| Luminance Exponent | 2.0 | 輝度加重の強さ (高い=明るい光源重視) |
-| Smoothing Alpha | 0.3 | 低い = よりスムーズ、高い = よりレスポンシブ |
+### フィクスチャマッピング (DMX Output → Fixture Mappings)
 
-### サンプリング方式の比較
+| 項目 | 内容 |
+|------|------|
+| Zone | 再現するゾーン名 |
+| Universe / Start Channel | 送信先。プロファイルのチャンネル数が 512 を超える場合は送らずに警告 (モニターで赤表示) |
+| **Profile** | 灯体プロファイルアセット。未設定なら下の内蔵プリセット |
+| Color Mode | 内蔵プリセット (Profile 未設定時) |
+| 強さのゲイン (BrightnessScale) | 目標 1.0 をこの灯体の何倍で出すか。灯体の距離・大きさの違いを吸収する |
 
-| 方式 | プローブ数 | CPU負荷 | 備考 |
-|------|-----------|---------|------|
-| GPU Compute | 10個以上可能 | 低 | 非同期ReadBack、2フレーム遅延 |
-| CPU Sync | 2-3個推奨 | 高 | フォールバック用 |
+コンポーネント全体の設定: `DMX Library` (指定するとそのライブラリの出力ポートだけに送る)、`Stage Calibration`、`Master Dimmer`。
 
----
+### 内蔵プリセット
 
-## 対応DMXカラーモード
+| プリセット | チャンネル | 備考 |
+|-----------|-----------|------|
+| RGB (3ch) | R, G, B | |
+| RGBW (4ch) | R, G, B, W | 白を優先して使う (色は厳密一致のまま) |
+| RGBAW (5ch) | R, G, B, A, W | アンバーは 590nm 前後の LED の近似値。**要キャリブレーション** |
+| Dimmer+RGB (4ch) | Dimmer, R, G, B | Dimmer = 明るさ、RGB = 混色比 |
+| CCT+Brightness (2ch) | CCT, Dimmer | 2700–6500K |
+| CCT & RGBW (10ch) | CCT, G/M, Dimmer, Crossfade, R, G, B, W, Strobe, Reserved | RGBW モード (Crossfade = 255) で使う。2700–7500K |
 
-| モード | チャンネル数 | 内容 |
-|--------|-------------|------|
-| RGB | 3 | R, G, B |
-| RGBW | 4 | R, G, B, White |
-| RGBAW | 5 | R, G, B, Amber, White |
-| Dimmer+RGB | 4 | Dimmer, R, G, B |
-| CCT+Brightness | 2 | 色温度, 明度 |
-| CCT & RGBW (10ch) | 10 | CCT, Green/Magenta, Dimmer, Crossfade, R, G, B, W, Strobe, Reserved |
+### 灯体プロファイル (ULightSyncFixtureProfile)
 
-CCT 値はリニアRGB → CIE xy → McCamy 近似で色温度を求め、マッピングの **CCT Min / Max Kelvin**
-(既定 2700K–6500K) で 0–255 に割り当てます。10ch モードの Green/Magenta・Crossfade・Strobe・Reserved は
-マッピングに設定した固定値を送ります。
+Content Browser で Data Asset として作るか、モニターのキャリブレーション欄で **「プリセットからアセットを作成して割り当て」** を押します (`/Game/LightSync/Profiles/`)。
 
----
+| 項目 | 内容 |
+|------|------|
+| Color Model | `Emitter Mix` (R/G/B/W/A… の混色をソルバで解く) / `CCT + Tint` (白色灯) |
+| Emitters | 各エミッタを 100% で点けたときの **カメラのリニア RGB** (キャリブレーションで埋まる)。`Is White` はソルバが優先して使う白 |
+| White Preference | 0 = 最小エネルギー解、1 = 白を最大限使う。色の一致が常に優先 |
+| Channels | 先頭から順の配置。機能は Emitter / Dimmer / CCT / Tint / Fixed、各チャンネル 8bit か **16bit (Coarse + Fine)** |
+| Dimming Curve | DMX レベル → 光出力。Linear / Gamma / LUT。Dimmer があれば Dimmer に、なければ各エミッタに適用する |
+| CCT / Tint レンジ | CCT チャンネル 0–最大 に対応する色温度、Tint (Duv) の範囲 |
 
-## 方向別カラー出力
+**ソルバの動作**
 
-VP撮影では、照明の位置によって異なる色が必要になることがあります。
-本プラグインは以下の4種類のカラーソースを提供します:
+1. 目標をカメラ空間へ変換し、エミッタのレベルを非負最小二乗で解く
+2. 灯体の色域外なら、色相を保ったまま白の方向へ彩度を下げる (**色域外** フラグ)
+3. レベルが 1 を超えたら全エミッタを等倍で下げる (**明るさ上限** フラグ)。チャンネルごとに切らないので色相は変わらない
+4. 調光カーブの逆変換 → 8 / 16bit に量子化
 
-| ソース | 説明 | 用途 |
-|--------|------|------|
-| Average | 全方向の輝度加重平均 | 一般的な照明同期 |
-| Top | 上方向 (+Z) のみ | 天井に配置したPavoTube等 |
-| Side | 横方向 (±X, ±Y) のみ | 側面に配置したPavoTube等 |
-| Dominant | 最も明るい光源の色 | スポットライト使用時 |
+CCT 灯体は、目標の色度から **CCT と Duv** (Ohno 2013) を求め、明るさはカメラ上の輝度比で決めます。レンジ外の色温度や Duv は **色域外** になります。
 
-**使い方:**
-1. LightProbeActor の Details パネルで **DMX Color Source** / **OSC Color Source** を設定
-2. 複数のプローブを使って、異なる位置から異なる方向のカラーを取得することも可能
+送信値と各フラグは、**DMX Output → Fixture Status** とモニターで確認できます。
 
 ---
 
-## ファイル構成
+## OSC 出力
+
+別 PC の照明ソフト (QLC+ / DasLight 等) に送るときに使います。ターゲットごとの設定は次のとおりです。
+
+| 項目 | 内容 |
+|------|------|
+| Zone | 送るゾーン |
+| Format | Float RGB / Int RGB (0-255) / Float RGBA / QLC+ 互換 / DasLight 互換 / カスタムアドレス |
+| **Value Mode** | `Fixture Levels` (既定): プロファイルとソルバで解いた DMX レベル。DasLight 形式ではプロファイルの全チャンネルを送る / `Target (Linear)` / `Target (sRGB Encoded)` |
+| Profile | Fixture Levels で使うプロファイル (未設定なら RGB) |
+| Intensity Gain | 強さのゲイン |
+
+アドレスの例: `/lightsync/{probe}/rgb`、QLC+ 互換 `/lightsync/{probe}/r|g|b`、DasLight 互換 `/dmx/{universe}/{channel}`。
+IP / Port を変えると自動で再接続します。
+
+---
+
+## キャリブレーション (カメラ)
+
+色度計がなくても、**撮影カメラとグレーカード** でキャリブレーションできます。
+モニターでプローブを選び、**キャリブレーション (カメラ)** 欄から行います。
+
+### 準備
+
+- カメラの **露出・ホワイトバランス・ISO・シャッター** は、全測定で固定する
+- グレーカードの位置:
+  - **壁の測定**: カードを壁に向けて壁の近く (視野の大半が壁になる位置)
+  - **灯体の測定**: 被写体の位置で、その灯体に向ける
+- **カメラの記録方式** を選ぶ: Linear / sRGB / Rec.709 / ARRI LogC3 (EI 800) / ARRI LogC4 / Sony S-Log3
+- 値は次のどちらかで記録する:
+  - **手入力**: DaVinci Resolve やカメラのスコープで読んだ、グレーカードのコード値 (0–1)
+  - **映像から**: カメラ映像 (Media Texture など) とグレーカードの範囲 (ROI) を指定し、[映像から] を押す。sRGB テクスチャとしてデコードされる映像は、自動でコード値に戻す
+
+### 灯体 → プロファイル
+
+1. 対象フィクスチャを選ぶ。プロファイルが無ければ **作成して割り当て** る
+2. 各ステップで [点灯] → 値を記録
+   - 消灯 (黒レベル)
+   - 各エミッタ 100%
+   - 全エミッタ 25 / 50 / 75 / 100% (調光カーブ用)
+3. **灯体をフィット → プロファイルに保存**
+   - エミッタの応答 (黒を差し引いたカメラ値)
+   - 調光カーブ: ガンマで最大誤差 2% 以内に収まればガンマ、収まらなければ測定点の LUT
+   - **加法性の誤差** (単独点灯の和 と 全点灯 の差) も報告する。5% を超える灯体は全点灯で出力が落ちている可能性がある
+
+### 壁 → ステージキャリブレーション (M_ref)
+
+1. ステージキャリブレーションを **作成して割り当て** (DMX / OSC 出力の両方に設定される)
+2. 各ステップで [表示] → 値を記録: 壁 黒 / 赤 / 緑 / 青 / 白
+   - プローブを囲む大きなパッチ (`LightSync Calibration Patch`) が出て、壁いっぱいにその色が映る
+   - 記録の瞬間に、**プローブ自身がパッチを測った値** も一緒に記録する。トーンカーブを予測する必要はない
+   - パッチの明るさは `パッチの明るさ` で調整する (壁の信号が白飛びしない程度に)
+3. **壁をフィット → ステージキャリブレーションに保存** (残差 RMS を表示)
+4. 最後に **テスト表示を終了** (パッチを消してプローブの出力を再開。ウィンドウを閉じても自動で終了する)
+
+テスト点灯中はプローブの出力を止めています (`Suspend Output`)。サンプリングは続いています。
+フィット結果はアセットの未保存変更になるので、保存してください。
+
+### 強さの合わせ方
+
+壁の測定 (カードは壁の近く) と灯体の測定 (カードは被写体の位置) が同じカメラ尺度で記録されていれば、強さのゲイン 1.0 で物理的に正しい比率になります。
+カメラ上でずれが残る場合は、フィクスチャの **強さのゲイン** で詰めてください。
+
+---
+
+## nDisplay 連携
+
+**Post Process Source** を `nDisplay Outer Viewport` にすると、プローブのキャプチャが、nDisplay が外側ビューポート (壁に映る環境) に適用するのと同じポストプロセスを使います。
+
+- `NDisplay Root Actor`: 未設定ならレベル内の最初の RootActor
+- `NDisplay Viewport Id`: Per-Viewport グレーディングを引くビューポート (例 `VP_0`。モニターに候補が出る)。プローブが再現したい方向の壁を映しているビューポートを選ぶ。空ならクラスタ全体のグレーディングだけを使う
+
+**合成の順序** (UE 5.7 の nDisplay と同じ)
 
 ```
-LightSyncDMX/
-├── LightSyncDMX.uplugin
-├── README.md
-├── BuildPlugin.bat                    (配布用パッケージビルド)
-├── Config/FilterPlugin.ini
-├── Resources/Icon128.png              (プラグインアイコン)
-├── Shaders/                           (GPU Compute Shaders)
-│   └── Private/
-│       └── LightSyncAverageCS.usf
-└── Source/
-    ├── LightSyncDMX/                  (Runtime Module)
-    │   ├── LightSyncDMX.Build.cs
-    │   ├── Public/
-    │   │   ├── LightSyncDMXModule.h
-    │   │   ├── LightProbeActor.h
-    │   │   ├── LightColorSamplerComponent.h
-    │   │   ├── LightSyncGPUSampler.h
-    │   │   ├── DMXColorOutputComponent.h
-    │   │   ├── OSCColorOutputComponent.h
-    │   │   ├── LightSyncSubsystem.h
-    │   │   └── LightSyncBlueprintLibrary.h
-    │   └── Private/
-    │       ├── LightSyncDMXModule.cpp
-    │       ├── LightProbeActor.cpp
-    │       ├── LightColorSamplerComponent.cpp
-    │       ├── LightSyncGPUSampler.cpp
-    │       ├── DMXColorOutputComponent.cpp
-    │       ├── OSCColorOutputComponent.cpp
-    │       ├── LightSyncSubsystem.cpp
-    │       └── LightSyncBlueprintLibrary.cpp
-    └── LightSyncDMXEditor/            (Editor Module)
-        ├── LightSyncDMXEditor.Build.cs
-        ├── Public/
-        │   ├── LightSyncDMXEditorModule.h
-        │   └── SLightSyncMonitorWidget.h
-        └── Private/
-            ├── LightSyncDMXEditorModule.cpp
-            └── SLightSyncMonitorWidget.cpp
+Start (カスタム PP) → シーン (参照カメラ / 手動露出) → Override → Final → FinalPerViewport
+FinalPerViewport = Entire Cluster グレーディング + Per-Viewport グレーディング
+```
+
+- グレーディング同士の合成: 露出補正・オフセット・WhiteTemp 等は **加算** (WhiteTemp は 1 枚増えるごとに −6500)、彩度・コントラスト・ガンマ・ゲインは **乗算**、TemperatureType は後勝ち、重みは積
+- レイヤーの重ね方: 数値は重みで補間、それ以外は置き換え (`FSceneView::OverridePostProcessSettings` と同じ)
+- 露出補正はシーンの Bias を **置き換える** (nDisplay と同じ)。EV100 はシーン側のまま残る
+
+nDisplay モジュールにはリンクせず、リフレクションで設定を読みます。nDisplay を使わないプロジェクトで nDisplay が有効になることはありません。
+適用されたレイヤーはモニターの **適用中の nDisplay レイヤー** に表示されます。
+
+---
+
+## モニターウィンドウ
+
+**Window → Virtual Production → LightSync DMX Monitor**
+
+- **ツールバー**: 全て有効 / 全て無効 / ブラックアウト / 今すぐサンプリング / マスターディマー / デバッグ表示 (ビューポートに各プローブの出力色を球で表示)
+- **プローブ一覧**: 状態と先頭ゾーンの色
+- 選択したプローブの設定 (編集はレベルの未保存変更になる):
+  - 基本
+  - 色の基準 (モード、取得元、露出、ゲイン、スムージング)
+  - ゾーンごとの結果 (正規化照度)
+  - DMX (ゾーン、プロファイル、使用チャンネル、ソルバの出力と警告)
+  - OSC
+  - キャリブレーション
+
+---
+
+## Blueprint / Python
+
+```
+// プローブ
+LightProbeActor.GetZoneColor(ZoneName) -> (bool, LinearColor)
+LightProbeActor.ForceSampleOnce()
+LightProbeActor.SetProbeActive(bool)
+
+// 一括制御 (LightSyncBlueprintLibrary)
+GetAllLightProbes / SetAllProbesActive / BlackoutAllProbes / SetMasterDimmer
+
+// 出力
+DMXColorOutputComponent.SendZoneColors / SendColor / SendRawToFixture / Blackout
+OSCColorOutputComponent.SendZoneColors / SendCustomOSCFloat / SendCustomOSCInt
+
+// キャリブレーション (ULightSyncCalibrator)
+BuildSteps / ShowFixtureStep / ShowWallStep / CaptureCameraFeed
+RecordFixtureMeasurement / RecordWallMeasurement / FitFixture / FitStage / EndTestOutput
+CreateProfileAssetForFixture / CreateStageCalibrationAsset   (エディタのみ)
+
+// 検証
+LightColorSamplerComponent.ValidateAgainstCPU() -> (bool, Report, MaxRelError)
 ```
 
 ---
 
-## 動作要件
+## 検証と診断
 
-- Unreal Engine 5.7 (ビルド済みバイナリは 5.7 専用)
-- DMX Protocol プラグイン (UE標準同梱)
-- DMX Engine プラグイン (UE標準同梱)
-- OSC プラグイン (UE標準同梱 - OSC出力使用時)
-- Art-Net / sACN 対応DMXインターフェース (DMX直接出力時)
-- ネットワーク接続 (OSC経由で別PCに送信する場合)
+### 自動テスト
+
+**Session Frontend → Automation** で `LightSync` を実行するか、コマンドラインで実行します。
+
+```
+UnrealEditor-Cmd <Project>.uproject -ExecCmds="Automation RunTests LightSync; Quit" -unattended -nullrhi
+```
+
+| グループ | 内容 |
+|----------|------|
+| `LightSync.Zones.*` | 立体角の合計 = 4π、一様環境 = 1.0、半球、分割で二重計上しない、除外、回転、Key の方向、EOTF のデコード |
+| `LightSync.ColorMath.*` | 色空間、CCT/Duv (D65 → 6504K、Planck 往復)、ソルバ、調光カーブ、量子化、Log の線形化、フィット |
+| `LightSync.Fixture.*` | 各プリセットの DMX 値、Dimmer 分離、ガンマ逆変換、16bit、キャリブレーション適用、ブラックアウト |
+| `LightSync.Calibration.*` | 合成した測定値から応答・ガンマ・LUT・M_ref を復元。校正後に灯体の光がカメラ上で壁と一致する |
+| `LightSync.NDisplay.*` | レイヤー合成の規則 |
+
+### GPU の検証
+
+静止したシーンで、コンソールコマンドを実行します。
+
+```
+LightSync.ValidateGPU
+```
+
+全プローブについて、GPU の積分結果と CPU の同じ式 (テストオラクル) を比べ、ゾーンごとの誤差をログに出します。開発時の実測では誤差 0.0015% 以下でした。
+
+### 実レンダリングでの確認 (開発時に実施)
+
+- 一様な Unlit ドーム (0.5, 1, 2): Scene モードで全ゾーン誤差 0.006%。EV +2 で正確に 1/4
+- Wall モード: 壁へ送る信号 (LDR キャプチャ) と、8bit 量子化の範囲で一致
+- DMX / OSC: 実パケットがソルバの理論値と一致 (例: RGB 64,128,32 / 10ch 0,0,96,255,85,255,0,85,0,0)
+- キャリブレーション: パッチの測定、M_ref の復元、テスト点灯の送信、映像の読み取り
+- nDisplay: ICVFX テンプレートの設定で、合成結果が理論どおり。同じ PP を持つ参照カメラと描画結果が一致
+
+**実機の LED ウォール・灯体・カメラでの最終的な一致は、各ステージでキャリブレーションして確認してください。**
 
 ---
 
-## インストール方法 (バイナリ配布版)
+## 制約と注意点
 
-### 受け取った人向け
-
-1. ZIP を展開して `LightSyncDMX` フォルダを取得
-2. 自分のUEプロジェクトの `Plugins/` フォルダにコピー
-   ```
-   MyProject/
-     Plugins/
-       LightSyncDMX/         ← ここに配置
-         LightSyncDMX.uplugin
-         Binaries/
-         Source/
-   ```
-3. UE Editor を起動（自動で有効化される）
-4. **Window > Virtual Production > LightSync DMX Monitor** からモニターウィンドウを開く
-
-### ソースからビルドする場合 (開発者向け)
-
-1. `LightSyncDMX` フォルダ (ソースのみ) をプロジェクトの `Plugins/` に配置
-2. UE Editor を起動するとソースからビルドされる
-3. MSVC 14.43+ を使う場合は `__has_feature` エラー対策が必要:
-   - プロジェクトの `Source/` に `MSVCCompat.h` を作成:
-     ```cpp
-     #pragma once
-     #ifndef __has_feature
-     #define __has_feature(x) 0
-     #endif
-     #ifndef __has_extension
-     #define __has_extension(x) 0
-     #endif
-     ```
-   - `*.Target.cs` に追記:
-     ```csharp
-     AdditionalCompilerArguments = "/FI\"" + Path.Combine(ProjectDirectory, "Source", "MSVCCompat.h") + "\"";
-     ```
+- **終了時の消灯**: UE の DMX 出力ポートは、エンジン終了が要求されると送信を止めます。そのためアプリ終了時のブラックアウトは Art-Net / sACN に届きません (OSC と PIE 停止では届きます)。必要なら、終了前に `BlackoutAllProbes` を呼んで 1 フレーム以上待つか、照明卓側で信号断時の動作を設定してください
+- **ポストプロセスボリューム** はプローブの位置で評価されます。nDisplay の視点と同じボリュームの中に置いてください (Unbound なら問題ありません)
+- 参照カメラの露出が **Auto** の場合は Manual として計算します。ICVFX では Manual 露出を推奨します
+- nDisplay の **Start** カスタム PP は「シーンの下」に入るのが本来の順序です。プローブではボリュームの評価順を完全には再現できません (通常の運用では使われない内部項目です)
+- **OCIO** を使う nDisplay 構成には未対応です (OCIO 変換後の信号を前提にした EOTF 選択が必要)
+- 内蔵プリセットのアンバーは近似値です。RGBAW 灯体はキャリブレーションしてください
+- **PIE 中** は、エディタワールド側のプローブは送信しません (二重送信を防ぐため)
+- 最大ゾーン数は 8 です
 
 ---
 
@@ -342,15 +388,102 @@ LightSyncDMX/
 |------|-------------|
 | DMX が出ない / ログに「DMX出力ポートが設定されていません」 | Project Settings → Plugins → DMX → Output Ports にポートを追加。DMX Library 指定時はライブラリ側の Output Ports も確認 |
 | ログに「512ch を超えます」 | Start Channel を下げる。モニターの「使用チャンネル」で範囲を確認 |
-| OSC が届かない | IP / Port、受信側ファイアウォール (UDP)、`Use OSC Output` と各 Target の `Enabled` |
+| フィクスチャが送られない / 「ゾーン '...' がプローブにありません」 | マッピングの Zone 名とプローブの Zones の Name を揃える |
+| 色が白っぽい・彩度が足りない (**色域外**) | 灯体の色域外。白の方向へ彩度を下げて出している。キャリブレーション済みか確認、より広色域の灯体を使う |
+| 明るさが頭打ち (**明るさ上限**) | 強さのゲイン / Output Gain を下げるか、灯体を近づける |
+| 壁と照明の明るさが合わない | 参照カメラの露出が Manual か、Reference Mode と Post Process Source が正しいか。キャリブレーションの強さの合わせ方を参照 |
+| OSC が届かない | IP / Port、受信側のファイアウォール (UDP)、`Use OSC Output` と各 Target の `Enabled` |
+| パッチが壁に映らない | パッチは `LightSync Calibration Patch` アクター。Multi-User 経由で nDisplay ノードに反映されているか確認。マテリアル `/LightSyncDMX/Calibration/M_LightSyncPatch` があるか |
 | PIE 中にエディタ側プローブの色が止まる | 仕様。PIE ワールドのプローブだけが送信する |
 | プローブを止めると照明が消える | 仕様。最後の色を残すなら `Blackout When Inactive` をオフ |
-| エディタ / ゲーム終了時に照明が最後の色のまま残る | UE の DMX 出力ポートはエンジン終了要求後に送信を止めるため、終了処理中のブラックアウトは Art-Net / sACN に届かない (OSC は届く)。PIE の停止では届く。終了前に `BlackoutAllProbes` を呼んで1フレーム以上待つか、照明卓側で信号断時の動作を設定する |
+| GPU の結果が怪しい | 静止したシーンで `LightSync.ValidateGPU` を実行し、CPU 版との誤差を見る |
 
-## パッケージビルド方法 (配布者向け)
+---
 
-`BuildPlugin.bat` を実行すると `PackagedPlugin/` にバイナリ同梱のプラグインが生成されます。
-そのフォルダを ZIP にして配布してください。
+## インストールとビルド
+
+### 動作要件
+
+- Unreal Engine 5.7 (ビルド済みバイナリは 5.7 専用)、Win64
+- DMX Protocol / DMX Engine / OSC プラグイン (UE 同梱)
+- Art-Net / sACN 対応の DMX インターフェース (DMX を直接出す場合)
+- nDisplay (任意。連携を使う場合)
+
+### バイナリ配布版
+
+1. ZIP を展開し、`LightSyncDMX` フォルダをプロジェクトの `Plugins/` にコピー
+2. エディタを起動 (自動で有効になる)
+3. **Window → Virtual Production → LightSync DMX Monitor**
+
+### ソースから (開発者向け)
+
+`LightSyncDMX` フォルダをプロジェクトの `Plugins/` に置いてエディタを起動すると、ソースからビルドされます。
+
+MSVC 14.43 以降で `__has_feature` のエラーが出る場合:
+
+- プロジェクトの `Source/` に `MSVCCompat.h` を作る
+
+  ```cpp
+  #pragma once
+  #ifndef __has_feature
+  #define __has_feature(x) 0
+  #endif
+  #ifndef __has_extension
+  #define __has_extension(x) 0
+  #endif
+  ```
+
+- `*.Target.cs` に追記する
+
+  ```csharp
+  AdditionalCompilerArguments = "/FI\"" + Path.Combine(ProjectDirectory, "Source", "MSVCCompat.h") + "\"";
+  ```
+
+### パッケージビルド (配布者向け)
+
+`BuildPlugin.bat [UE のインストール先]` を実行すると、`PackagedPlugin/` にバイナリ同梱のプラグインができます (Editor / Game Development / Shipping)。
+
+### ファイル構成
+
+```
+LightSyncDMX/
+├── LightSyncDMX.uplugin
+├── BuildPlugin.bat
+├── Config/FilterPlugin.ini
+├── Content/Calibration/M_LightSyncPatch.uasset   キャリブレーション用パッチ
+├── Resources/Icon128.png
+├── Shaders/Private/LightSyncAverageCS.usf        ゾーン積分 (ピーク → 精密化 → 積分)
+└── Source/
+    ├── LightSyncDMX/                               ランタイム
+    │   ├── LightProbeActor                         プローブ、基準モード、露出
+    │   ├── LightColorSamplerComponent              ゾーン、スムージング
+    │   ├── LightSyncGPUSampler                     GPU 積分と非同期リードバック
+    │   ├── LightSyncZones                          ゾーン定義、CPU 版積分器 (オラクル)
+    │   ├── LightSyncColorMath                      色空間、CCT/Duv、ソルバ、調光カーブ、Log、フィット
+    │   ├── LightSyncFixtureProfile                 灯体プロファイル、プリセット、DMX 値の計算
+    │   ├── DMXColorOutputComponent / OSCColorOutputComponent
+    │   ├── LightSyncCalibrator / LightSyncCalibrationPatch
+    │   ├── LightSyncNDisplay                       nDisplay の PP 合成 (リフレクション)
+    │   ├── LightSyncSubsystem / LightSyncBlueprintLibrary
+    │   └── Private/Tests/                          自動テスト
+    └── LightSyncDMXEditor/                         モニターウィンドウ
+```
+
+---
+
+## 1.x からの移行
+
+2.0 は色の計算を作り直したため、**プローブの色関連の設定に互換性はありません**。
+DMX の Universe / Start Channel / カラーモード (= 内蔵プリセット)、OSC の送信先は引き継がれます。
+
+| 1.x | 2.0 |
+|-----|-----|
+| DMX / OSC の Color Source (Average / Top / Side / Dominant) | フィクスチャ / ターゲットごとの **Zone** (既定ゾーン `Average` / `Top` / `Side` / `Key`) |
+| ガンマ補正・色温度オフセット・彩度・明度・色のみモード | 削除。基準モード + 露出 + Output Gain、灯体側はプロファイルと強さのゲイン |
+| サンプラーの輝度べき乗・直接光フィルター・HDR クランプ・独自トーンマップ・彩度ブースト・面の重み | 削除 (立体角で正しい積分に置き換え) |
+| Smoothing Alpha (サンプルごと) | Smoothing Time Constant (秒) |
+| 10ch モードの固定値 (G/M・Crossfade・Strobe・Reserved) | プロファイルの Fixed チャンネル |
+| CCT の B/R 比による推定 | Ohno 2013 の CCT + Duv |
 
 ## ライセンス
 
