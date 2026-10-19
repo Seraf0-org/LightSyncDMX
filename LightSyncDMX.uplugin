@@ -10,7 +10,7 @@
 	"DocsURL": "https://github.com/Seraf0-org/LightSyncDMX#readme",
 	"MarketplaceURL": "",
 	"SupportURL": "https://github.com/Seraf0-org/LightSyncDMX/issues",
-	"CanContainContent": false,
+	"CanContainContent": true,
 	"IsBetaVersion": false,
 	"IsExperimentalVersion": false,
 	"Installed": true,

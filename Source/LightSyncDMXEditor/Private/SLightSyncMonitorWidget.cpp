@@ -5,6 +5,10 @@
 #include "LightProbeActor.h"
 #include "DMXColorOutputComponent.h"
 #include "OSCColorOutputComponent.h"
+#include "LightSyncCalibrator.h"
+#include "PropertyCustomizationHelpers.h"
+#include "AssetRegistry/AssetData.h"
+#include "Engine/Texture.h"
 
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SBorder.h"
@@ -73,6 +77,15 @@ static_assert(NumOSCFormats == 6, "OSCFormatNames と EOSCMessageFormat の要�
 // ============================================================
 // Construct
 // ============================================================
+
+SLightSyncMonitorWidget::~SLightSyncMonitorWidget()
+{
+    // ウィンドウを閉じたらテスト表示を片付けてプローブの出力を再開する
+    if (Calibrator.IsValid())
+    {
+        Calibrator->EndTestOutput();
+    }
+}
 
 void SLightSyncMonitorWidget::Construct(const FArguments& InArgs)
 {
@@ -448,6 +461,7 @@ void SLightSyncMonitorWidget::RefreshSettingsPanel()
     BuildReferenceSection(Probe);
     BuildDMXSection(Probe);
     BuildOSCSection(Probe);
+    BuildCalibrationSection(Probe);
 }
 
 // ============================================================
@@ -1025,6 +1039,296 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                 if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
                     W->OSCOutput->Targets[0].AddressPrefix = T.ToString();
             }));
+}
+
+// ============================================================
+// キャリブレーション (カメラ)
+// ============================================================
+
+TSharedRef<SWidget> SLightSyncMonitorWidget::MakeStepRow(bool bWall, int32 Index)
+{
+    TWeakObjectPtr<ULightSyncCalibrator> C(Calibrator.Get());
+
+    auto GetStep = [C, bWall, Index]() -> FLightSyncCalibrationStep*
+    {
+        if (!C.IsValid()) return nullptr;
+        TArray<FLightSyncCalibrationStep>& Steps = bWall ? C->WallSteps : C->FixtureSteps;
+        return Steps.IsValidIndex(Index) ? &Steps[Index] : nullptr;
+    };
+
+    auto Record = [this, C, bWall, Index](const FLinearColor& Code)
+    {
+        if (!C.IsValid()) return;
+        const bool bOk = bWall ? C->RecordWallMeasurement(Index, Code) : C->RecordFixtureMeasurement(Index, Code);
+        if (!bOk && CalibrationReport.IsValid())
+        {
+            CalibrationReport->SetText(FText::FromString(C->LastReport));
+        }
+    };
+
+    auto MakeChannel = [GetStep, Record](int32 Channel) -> TSharedRef<SWidget>
+    {
+        return SNew(SSpinBox<float>)
+            .MinValue(0.0f).MaxValue(1.0f).Delta(0.001f)
+            .MinDesiredWidth(56.0f)
+            .Value_Lambda([GetStep, Channel]() {
+                const FLightSyncCalibrationStep* S = GetStep();
+                return S ? S->CameraCode.Component(Channel) : 0.0f;
+            })
+            .OnValueCommitted_Lambda([GetStep, Record, Channel](float V, ETextCommit::Type) {
+                if (FLightSyncCalibrationStep* S = GetStep())
+                {
+                    FLinearColor Code = S->CameraCode;
+                    Code.Component(Channel) = V;
+                    Record(Code);
+                }
+            });
+    };
+
+    return SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(0.30f).VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(STextBlock)
+                .Text_Lambda([GetStep, C, bWall, Index]() {
+                    const FLightSyncCalibrationStep* S = GetStep();
+                    if (!S) return FText::GetEmpty();
+                    const bool bActive = C.IsValid() && (bWall ? C->ActiveWallStep : C->ActiveFixtureStep) == Index;
+                    return FText::FromString(FString::Printf(TEXT("%s%s%s"), bActive ? TEXT("▶ ") : TEXT(""), *S->Label,
+                                                             S->bMeasured ? TEXT("  ✓") : TEXT("")));
+                })]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+            [SNew(SButton)
+                .Text(bWall ? LOCTEXT("CalShowPatch", "表示") : LOCTEXT("CalLight", "点灯"))
+                .OnClicked_Lambda([C, bWall, Index]() {
+                    if (C.IsValid())
+                    {
+                        bWall ? C->ShowWallStep(Index) : C->ShowFixtureStep(Index);
+                    }
+                    return FReply::Handled();
+                })]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[MakeChannel(0)]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[MakeChannel(1)]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[MakeChannel(2)]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+            [SNew(SButton)
+                .Text(LOCTEXT("CalFromFeed", "映像から"))
+                .ToolTipText(LOCTEXT("CalFromFeedTip", "カメラ映像の ROI を平均してこのステップに記録"))
+                .IsEnabled_Lambda([C]() { return C.IsValid() && C->CameraFeed != nullptr; })
+                .OnClicked_Lambda([this, C, Record]() {
+                    FLinearColor Code;
+                    if (C.IsValid() && C->CaptureCameraFeed(Code))
+                    {
+                        Record(Code);
+                    }
+                    else if (CalibrationReport.IsValid())
+                    {
+                        CalibrationReport->SetText(LOCTEXT("CalFeedFailed", "カメラ映像を読めませんでした (テクスチャと ROI を確認)"));
+                    }
+                    return FReply::Handled();
+                })];
+}
+
+void SLightSyncMonitorWidget::BuildCalibrationSection(ALightProbeActor* Probe)
+{
+    if (!Calibrator.IsValid())
+    {
+        Calibrator.Reset(NewObject<ULightSyncCalibrator>());
+    }
+    if (Calibrator->Probe != Probe)
+    {
+        Calibrator->EndTestOutput();
+        Calibrator->Probe = Probe;
+        Calibrator->FixtureIndex = 0;
+        Calibrator->BuildSteps();
+    }
+
+    TWeakObjectPtr<ULightSyncCalibrator> C(Calibrator.Get());
+    TWeakObjectPtr<ALightProbeActor> W(Probe);
+
+    AddSectionHeader(LOCTEXT("SecCalibration", "キャリブレーション (カメラ)"));
+
+    SettingsPanelBox->AddSlot().AutoHeight().Padding(8.0f, 2.0f)
+        [SNew(STextBlock)
+            .AutoWrapText(true)
+            .Text(LOCTEXT("CalHelp",
+                "カメラの露出・ホワイトバランスは全測定で固定。グレーカードを置き、各ステップを [点灯]/[表示] してから"
+                "グレーカードのコード値 (0-1、カメラの記録方式のまま) を入力するか [映像から] で取得する。"
+                "壁の測定はカードを壁の近くで壁に向け、灯体の測定は被写体の位置で灯体に向ける。"))];
+
+    // --- カメラ ---
+    AddLabeledRow(LOCTEXT("CalTransfer", "カメラの記録方式"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(0.3f)
+            [SNew(SSpinBox<int32>)
+                .MinValue(0).MaxValue(static_cast<int32>(ELightSyncCameraTransfer::SonySLog3)).Delta(1)
+                .Value_Lambda([C]() { return C.IsValid() ? static_cast<int32>(C->CameraTransfer) : 0; })
+                .OnValueChanged_Lambda([C](int32 V) { if (C.IsValid()) C->CameraTransfer = static_cast<ELightSyncCameraTransfer>(V); })]
+        + SHorizontalBox::Slot().FillWidth(0.7f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
+            [SNew(STextBlock)
+                .Text_Lambda([C]() {
+                    return C.IsValid() ? StaticEnum<ELightSyncCameraTransfer>()->GetDisplayNameTextByValue(static_cast<int64>(C->CameraTransfer))
+                                       : FText::GetEmpty();
+                })]);
+
+    AddLabeledRow(LOCTEXT("CalFeed", "カメラ映像 (任意)"),
+        SNew(SObjectPropertyEntryBox)
+            .AllowedClass(UTexture::StaticClass())
+            .AllowClear(true)
+            .ObjectPath_Lambda([C]() { return (C.IsValid() && C->CameraFeed) ? C->CameraFeed->GetPathName() : FString(); })
+            .OnObjectChanged_Lambda([C](const FAssetData& Asset) { if (C.IsValid()) C->CameraFeed = Cast<UTexture>(Asset.GetAsset()); }));
+
+    auto MakeROI = [C](bool bMax, bool bY) -> TSharedRef<SWidget>
+    {
+        return SNew(SSpinBox<float>)
+            .MinValue(0.0f).MaxValue(1.0f).Delta(0.005f).MinDesiredWidth(56.0f)
+            .Value_Lambda([C, bMax, bY]() {
+                if (!C.IsValid()) return 0.0f;
+                const FVector2D& P = bMax ? C->FeedROIMax : C->FeedROIMin;
+                return static_cast<float>(bY ? P.Y : P.X);
+            })
+            .OnValueChanged_Lambda([C, bMax, bY](float V) {
+                if (!C.IsValid()) return;
+                FVector2D& P = bMax ? C->FeedROIMax : C->FeedROIMin;
+                (bY ? P.Y : P.X) = V;
+            });
+    };
+    AddLabeledRow(LOCTEXT("CalROI", "グレーカード範囲 (左上 x,y / 右下 x,y)"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[MakeROI(false, false)]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[MakeROI(false, true)]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[MakeROI(true, false)]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[MakeROI(true, true)]);
+
+    AddLabeledRow(LOCTEXT("CalFeedSRGB", "映像を sRGB テクスチャとして読む"),
+        SNew(SCheckBox)
+            .IsChecked_Lambda([C]() { return (C.IsValid() && C->bFeedSampledAsSRGB) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .OnCheckStateChanged_Lambda([C](ECheckBoxState S) { if (C.IsValid()) C->bFeedSampledAsSRGB = (S == ECheckBoxState::Checked); }));
+
+    // --- 灯体 ---
+    AddSectionHeader(LOCTEXT("SecCalFixture", "灯体 → プロファイル"));
+
+    const int32 NumFixtures = Probe->DMXOutput ? Probe->DMXOutput->FixtureMappings.Num() : 0;
+    AddLabeledRow(LOCTEXT("CalFixtureIndex", "対象フィクスチャ"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(0.3f)
+            [SNew(SSpinBox<int32>)
+                .MinValue(0).MaxValue(FMath::Max(NumFixtures - 1, 0)).Delta(1)
+                .Value_Lambda([C]() { return C.IsValid() ? C->FixtureIndex : 0; })
+                .OnValueCommitted_Lambda([this, C](int32 V, ETextCommit::Type) {
+                    if (C.IsValid() && C->FixtureIndex != V)
+                    {
+                        C->FixtureIndex = V;
+                        C->BuildSteps();
+                        RefreshSettingsPanel();
+                    }
+                })]
+        + SHorizontalBox::Slot().FillWidth(0.7f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
+            [SNew(STextBlock)
+                .Text_Lambda([W, C]() -> FText {
+                    if (!W.IsValid() || !C.IsValid() || !W->DMXOutput || !W->DMXOutput->FixtureMappings.IsValidIndex(C->FixtureIndex))
+                        return LOCTEXT("CalNoFixture", "(フィクスチャがありません)");
+                    const FDMXFixtureMapping& M = W->DMXOutput->FixtureMappings[C->FixtureIndex];
+                    return FText::FromString(FString::Printf(TEXT("%s  /  プロファイル: %s"), *M.FixtureName,
+                        M.Profile ? *M.Profile->GetName() : TEXT("なし (内蔵プリセット)")));
+                })]);
+
+    AddLabeledRow(LOCTEXT("CalProfileAsset", "プロファイルアセット"),
+        SNew(SButton)
+            .Text(LOCTEXT("CalCreateProfile", "プリセットからアセットを作成して割り当て"))
+            .IsEnabled_Lambda([W, C]() {
+                return W.IsValid() && C.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(C->FixtureIndex)
+                    && W->DMXOutput->FixtureMappings[C->FixtureIndex].Profile == nullptr;
+            })
+            .OnClicked_Lambda([this, C]() {
+                if (C.IsValid() && C->CreateProfileAssetForFixture())
+                {
+                    C->BuildSteps();
+                    RefreshSettingsPanel();
+                }
+                return FReply::Handled();
+            }));
+
+    for (int32 Index = 0; Index < Calibrator->FixtureSteps.Num(); ++Index)
+    {
+        SettingsPanelBox->AddSlot().AutoHeight().Padding(8.0f, 1.0f)[MakeStepRow(false, Index)];
+    }
+
+    // --- 壁 ---
+    AddSectionHeader(LOCTEXT("SecCalWall", "壁 → ステージキャリブレーション (M_ref)"));
+
+    AddLabeledRow(LOCTEXT("CalStageAsset", "ステージキャリブレーション"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+            [SNew(STextBlock)
+                .Text_Lambda([W]() -> FText {
+                    return (W.IsValid() && W->DMXOutput && W->DMXOutput->StageCalibration)
+                        ? FText::FromString(W->DMXOutput->StageCalibration->GetName())
+                        : LOCTEXT("CalNoStage", "なし (単位行列)");
+                })]
+        + SHorizontalBox::Slot().AutoWidth().Padding(4.0f, 0.0f)
+            [SNew(SButton)
+                .Text(LOCTEXT("CalCreateStage", "作成して割り当て"))
+                .IsEnabled_Lambda([W]() { return W.IsValid() && W->DMXOutput && !W->DMXOutput->StageCalibration; })
+                .OnClicked_Lambda([C]() { if (C.IsValid()) C->CreateStageCalibrationAsset(); return FReply::Handled(); })]);
+
+    AddLabeledRow(LOCTEXT("CalPatchIntensity", "パッチの明るさ (エミッシブ)"),
+        SNew(SSpinBox<float>)
+            .MinValue(0.001f).MaxValue(1000.0f).Delta(0.01f)
+            .Value_Lambda([C]() { return C.IsValid() ? C->PatchIntensity : 1.0f; })
+            .OnValueChanged_Lambda([C](float V) { if (C.IsValid()) C->PatchIntensity = V; }));
+
+    AddLabeledRow(LOCTEXT("CalRefZone", "基準値を読むゾーン (Sphere 推奨)"),
+        SNew(SEditableTextBox)
+            .Text_Lambda([C]() { return C.IsValid() ? FText::FromName(C->ReferenceZone) : FText::GetEmpty(); })
+            .OnTextCommitted_Lambda([C](const FText& T, ETextCommit::Type) { if (C.IsValid()) C->ReferenceZone = FName(*T.ToString()); }));
+
+    for (int32 Index = 0; Index < Calibrator->WallSteps.Num(); ++Index)
+    {
+        SettingsPanelBox->AddSlot().AutoHeight().Padding(8.0f, 1.0f)[MakeStepRow(true, Index)];
+    }
+
+    // --- フィット ---
+    SettingsPanelBox->AddSlot().AutoHeight().Padding(8.0f, 6.0f)
+        [SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+            [SNew(SButton)
+                .Text(LOCTEXT("CalFitFixture", "灯体をフィット → プロファイルに保存"))
+                .OnClicked_Lambda([this, C]() {
+                    FString Report;
+                    if (C.IsValid())
+                    {
+                        C->FitFixture(nullptr, Report);
+                        if (CalibrationReport.IsValid()) CalibrationReport->SetText(FText::FromString(Report));
+                    }
+                    return FReply::Handled();
+                })]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+            [SNew(SButton)
+                .Text(LOCTEXT("CalFitStage", "壁をフィット → ステージキャリブレーションに保存"))
+                .OnClicked_Lambda([this, C]() {
+                    FString Report;
+                    if (C.IsValid())
+                    {
+                        C->FitStage(nullptr, Report);
+                        if (CalibrationReport.IsValid()) CalibrationReport->SetText(FText::FromString(Report));
+                    }
+                    return FReply::Handled();
+                })]
+        + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+            [SNew(SButton)
+                .Text(LOCTEXT("CalEnd", "テスト表示を終了"))
+                .ToolTipText(LOCTEXT("CalEndTip", "パッチを消してプローブの出力を再開する"))
+                .OnClicked_Lambda([C]() { if (C.IsValid()) C->EndTestOutput(); return FReply::Handled(); })]];
+
+    SettingsPanelBox->AddSlot().AutoHeight().Padding(8.0f, 2.0f)
+        [SAssignNew(CalibrationReport, STextBlock)
+            .AutoWrapText(true)
+            .Text(FText::FromString(Calibrator->LastReport))];
+
+    SettingsPanelBox->AddSlot().AutoHeight().Padding(8.0f, 2.0f)
+        [SNew(STextBlock)
+            .AutoWrapText(true)
+            .ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+            .Text(LOCTEXT("CalSaveNote", "フィット結果はアセットの未保存変更になります。Ctrl+Shift+S などで保存してください。"))];
 }
 
 // ============================================================

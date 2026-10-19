@@ -284,7 +284,11 @@ void ALightProbeActor::ForceSampleOnce()
         ColorSampler->SampleFromRenderTarget(CaptureRenderTarget, Context);
     }
 
-    // 3) 出力
+    // 3) 出力 (キャリブレーション中は止める)
+    if (bSuspendOutput)
+    {
+        return;
+    }
     if (bUseDMXOutput && DMXOutput && ColorSampler)
     {
         DMXOutput->SendZoneColors(ColorSampler->ZoneResults);

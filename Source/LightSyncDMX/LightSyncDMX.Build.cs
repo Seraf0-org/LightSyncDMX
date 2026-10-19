@@ -28,6 +28,7 @@ public class LightSyncDMX : ModuleRules
         {
             "Slate",
             "SlateCore",
+            "AssetRegistry",
         });
     }
 }

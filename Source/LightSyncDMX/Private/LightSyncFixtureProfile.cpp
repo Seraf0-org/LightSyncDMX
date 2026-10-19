@@ -363,4 +363,56 @@ namespace LightSyncFixture
         }
         return Out;
     }
+
+    FLightSyncFixtureOutput ComputeTestPattern(const FLightSyncFixtureProfileData &Profile,
+                                               const TArray<double> &EmitterLevels, double DimmerLevel)
+    {
+        FLightSyncFixtureOutput Out;
+        const bool bCCTModel = Profile.ColorModel == ELightSyncFixtureColorModel::CCT;
+        for (const FLightSyncFixtureChannel &Channel : Profile.Channels)
+        {
+            switch (Channel.Function)
+            {
+            case ELightSyncChannelFunction::Emitter:
+                if (bCCTModel)
+                {
+                    WriteLevel(Out.Values, Channel, DimmerLevel);
+                }
+                else
+                {
+                    WriteLevel(Out.Values, Channel, EmitterLevels.IsValidIndex(Channel.EmitterIndex) ? EmitterLevels[Channel.EmitterIndex] : 0.0);
+                }
+                break;
+            case ELightSyncChannelFunction::Dimmer:
+                WriteLevel(Out.Values, Channel, DimmerLevel);
+                break;
+            case ELightSyncChannelFunction::CCT:
+                if (bCCTModel)
+                {
+                    WriteLevel(Out.Values, Channel, 0.5);
+                }
+                else
+                {
+                    WriteFixed(Out.Values, Channel);
+                }
+                break;
+            case ELightSyncChannelFunction::Tint:
+                if (bCCTModel)
+                {
+                    const double Neutral = (0.0 - Profile.TintMinDuv) / FMath::Max<double>(Profile.TintMaxDuv - Profile.TintMinDuv, 1e-6);
+                    WriteLevel(Out.Values, Channel, Neutral);
+                }
+                else
+                {
+                    WriteFixed(Out.Values, Channel);
+                }
+                break;
+            default:
+                WriteFixed(Out.Values, Channel);
+                break;
+            }
+        }
+        return Out;
+    }
 }
+

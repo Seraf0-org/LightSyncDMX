@@ -5,9 +5,13 @@
 #include "CoreMinimal.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
+#include "UObject/StrongObjectPtr.h"
+#include "LightSyncCalibrator.h"
 
 class ULightSyncSubsystem;
 class ALightProbeActor;
+
+class STextBlock;
 
 /**
  * SLightSyncMonitorWidget
@@ -23,6 +27,8 @@ class SLightSyncMonitorWidget : public SCompoundWidget
 public:
     SLATE_BEGIN_ARGS(SLightSyncMonitorWidget) {}
     SLATE_END_ARGS()
+
+    virtual ~SLightSyncMonitorWidget();
 
     void Construct(const FArguments& InArgs);
     virtual void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override;
@@ -42,6 +48,8 @@ private:
     void BuildReferenceSection(ALightProbeActor* Probe);
     void BuildDMXSection(ALightProbeActor* Probe);
     void BuildOSCSection(ALightProbeActor* Probe);
+    void BuildCalibrationSection(ALightProbeActor* Probe);
+    TSharedRef<SWidget> MakeStepRow(bool bWall, int32 Index);
 
     // === レイアウトヘルパー ===
     void AddSectionHeader(const FText& Title);
@@ -69,4 +77,8 @@ private:
 
     float MasterDimmerValue = 1.0f;
     FString SelectedProbeName;
+
+    /** カメラキャリブレーション (選択プローブ用) */
+    TStrongObjectPtr<ULightSyncCalibrator> Calibrator;
+    TSharedPtr<STextBlock> CalibrationReport;
 };

@@ -106,6 +106,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
     bool bBlackoutWhenInactive = true;
 
+    /** 出力 (DMX / OSC) を一時停止する。サンプリングは続ける (キャリブレーションのテスト点灯中に使う) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Transient, Category = "LightProbe|Settings")
+    bool bSuspendOutput = false;
+
     /** プローブ名 (識別用) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
     FString ProbeName = TEXT("LightProbe_01");

@@ -261,4 +261,12 @@ namespace LightSyncFixture
 
     /** 消灯 (エミッタ / Dimmer = 0、固定値はそのまま) */
     LIGHTSYNCDMX_API FLightSyncFixtureOutput ComputeBlackout(const FLightSyncFixtureProfileData& Profile);
+
+    /**
+     * キャリブレーション用のテスト点灯 (調光カーブを通さない生の DMX レベル)。
+     * EmitterLevels[i] をエミッタ i のチャンネルに、DimmerLevel を Dimmer に送る。
+     * CCT モデルでは CCT = 中央、Tint = 0 (Duv)、明るさ = DimmerLevel。固定値はそのまま。
+     */
+    LIGHTSYNCDMX_API FLightSyncFixtureOutput ComputeTestPattern(const FLightSyncFixtureProfileData& Profile,
+                                                                const TArray<double>& EmitterLevels, double DimmerLevel);
 }
