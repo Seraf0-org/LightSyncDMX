@@ -16,7 +16,7 @@ class ALightProbeActor;
  * プローブ選択でDMX/OSC設定を直接編集できる統合ウィンドウ。
  *
  * 上段: プローブ一覧 (クリック選択)
- * 下段: 選択プローブの設定 (基本/色補正/DMX/OSC)
+ * 下段: 選択プローブの設定 (基本/色の基準とゾーン/DMX/OSC)
  */
 class SLightSyncMonitorWidget : public SCompoundWidget
 {
@@ -39,7 +39,7 @@ private:
 
     // === 設定セクション構築 ===
     void BuildGeneralSection(ALightProbeActor* Probe);
-    void BuildColorCorrectionSection(ALightProbeActor* Probe);
+    void BuildReferenceSection(ALightProbeActor* Probe);
     void BuildDMXSection(ALightProbeActor* Probe);
     void BuildOSCSection(ALightProbeActor* Probe);
 

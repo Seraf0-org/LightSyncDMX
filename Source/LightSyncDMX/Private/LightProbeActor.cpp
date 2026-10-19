@@ -11,7 +11,8 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/TextureRenderTargetCube.h"
 #include "UObject/ConstructorHelpers.h"
-#include "Materials/MaterialInstanceDynamic.h"
+#include "Camera/CameraComponent.h"
+#include "HAL/IConsoleManager.h"
 #include "LightSyncSubsystem.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
@@ -51,24 +52,8 @@ ALightProbeActor::ALightProbeActor()
     SceneCapture->bCaptureOnMovement = false;
     SceneCapture->bAlwaysPersistRenderingState = true;
 
-    // === 正確な色キャプチャのための設定 ===
-    // パフォーマンス最適化
-    SceneCapture->ShowFlags.SetAntiAliasing(false);
-    SceneCapture->ShowFlags.SetMotionBlur(false);
-
-    // 色に影響するポストプロセスを全て無効化 (生リニアHDR取得)
-    SceneCapture->ShowFlags.SetTonemapper(false);        // ★ ACES等のトーンマッピングを無効化
-    SceneCapture->ShowFlags.SetEyeAdaptation(false);     // 自動露出を無効化
-    SceneCapture->ShowFlags.SetBloom(false);              // ブルームを無効化
-    SceneCapture->ShowFlags.SetColorGrading(false);       // カラーグレーディングを無効化
-    SceneCapture->ShowFlags.SetVignette(false);           // ビネットを無効化
-    SceneCapture->ShowFlags.SetGrain(false);              // フィルムグレインを無効化
-    SceneCapture->ShowFlags.SetLensFlares(false);         // レンズフレアを無効化
-    SceneCapture->ShowFlags.SetAmbientOcclusion(false);   // AO (色に影響するため)
-
-    // 環境エフェクト (不要)
-    SceneCapture->ShowFlags.SetFog(false);
-    SceneCapture->ShowFlags.SetVolumetricFog(false);
+    // CaptureSource / ShowFlags / PostProcess は基準モードに合わせて ApplyCaptureSettings() で毎回設定する
+    SceneCapture->bCaptureRotation = false; // キューブの面は常にワールド軸 (ゾーン方向はプローブ回転で変換)
 
     // SceneCaptureは自身のProbeMeshをキャプチャしない
     SceneCapture->HiddenActors.Add(this);
@@ -208,7 +193,7 @@ void ALightProbeActor::DrawDebugProbe() const
     }
 
     const FVector Location = GetActorLocation();
-    const FColor DrawColor = bIsProbeActive ? CorrectedOutputColor.ToFColor(true) : FColor(64, 64, 64);
+    const FColor DrawColor = bIsProbeActive ? GetCurrentColor().ToFColor(true) : FColor(64, 64, 64);
     DrawDebugSphere(World, Location, 25.0f, 16, DrawColor, false, -1.0f, SDPG_Foreground, 2.0f);
     DrawDebugString(World, Location + FVector(0.0f, 0.0f, 40.0f),
                     FString::Printf(TEXT("%s (%d,%d,%d)"), *ProbeName, DrawColor.R, DrawColor.G, DrawColor.B),
@@ -289,86 +274,179 @@ void ALightProbeActor::ForceSampleOnce()
         return;
     }
 
-    // 1) SceneCaptureでキュービックキャプチャを実行
+    // 1) 基準モードに合わせてキャプチャ設定を更新し、キュービックキャプチャを実行
+    const FLightSyncSampleContext Context = ApplyCaptureSettings();
     SceneCapture->CaptureScene();
 
-    // 2) ColorSamplerでレンダーターゲットから平均色を読み取り
+    // 2) ゾーンごとに積分 (GPU 結果は 1〜2 フレーム後に反映)
     if (ColorSampler)
     {
-        ColorSampler->SampleFromRenderTarget(CaptureRenderTarget);
-        
-        // 全方向の色を取得
-        CurrentSampledColor = ColorSampler->GetSampledColor();
-        CurrentTopColor = ColorSampler->GetTopColor();
-        CurrentSideColor = ColorSampler->GetSideColor();
-        CurrentDominantColor = ColorSampler->GetDominantColor();
+        ColorSampler->SampleFromRenderTarget(CaptureRenderTarget, Context);
     }
 
-    // 3) 色補正を適用 (全体平均)
-    CorrectedOutputColor = ApplyColorCorrection(CurrentSampledColor);
-
-    // 4) DMX出力用の色を取得
-    FLinearColor DMXOutputColor = ApplyColorCorrection(GetColorBySource(DMXColorSource));
-    DMXOutputColor = ApplyColorOnlyMode(DMXOutputColor);
-
-    // 5) OSC出力用の色を取得
-    FLinearColor OSCOutputColor = ApplyColorCorrection(GetColorBySource(OSCColorSource));
-    OSCOutputColor = ApplyColorOnlyMode(OSCOutputColor);
-
-    // 6) DMX出力に色を渡す
-    if (bUseDMXOutput && DMXOutput)
+    // 3) 出力
+    if (bUseDMXOutput && DMXOutput && ColorSampler)
     {
-        DMXOutput->SendColor(DMXOutputColor);
+        DMXOutput->SendZoneColors(ColorSampler->ZoneResults);
     }
-
-    // 7) OSC出力に色を渡す (別PCへのネットワーク送信)
-    if (bUseOSCOutput && OSCOutput)
+    if (bUseOSCOutput && OSCOutput && ColorSampler)
     {
-        OSCOutput->SendColor(OSCOutputColor);
+        OSCOutput->SendZoneColors(ColorSampler->ZoneResults);
     }
 }
 
-FLinearColor ALightProbeActor::GetColorBySource(ELightProbeColorSource Source) const
+bool ALightProbeActor::GetZoneColor(FName ZoneName, FLinearColor &OutColor) const
 {
-    switch (Source)
+    if (ColorSampler)
     {
-    case ELightProbeColorSource::Top:
-        return CurrentTopColor;
-    case ELightProbeColorSource::Side:
-        return CurrentSideColor;
-    case ELightProbeColorSource::Dominant:
-        return CurrentDominantColor;
-    case ELightProbeColorSource::Average:
-    default:
-        return CurrentSampledColor;
+        return ColorSampler->GetZoneColor(ZoneName, OutColor);
+    }
+    OutColor = FLinearColor::Black;
+    return false;
+}
+
+FLinearColor ALightProbeActor::GetCurrentColor() const
+{
+    return (ColorSampler && ColorSampler->ZoneResults.Num() > 0) ? ColorSampler->ZoneResults[0].Color : FLinearColor::Black;
+}
+
+bool ALightProbeActor::GetReferenceCameraPostProcess(FPostProcessSettings &OutSettings) const
+{
+    if (!ReferenceCamera)
+    {
+        return false;
+    }
+
+    UCameraComponent *Camera = ReferenceCamera->FindComponentByClass<UCameraComponent>();
+    if (!Camera)
+    {
+        return false;
+    }
+
+    // CineCamera の絞り等が反映された最終的なビュー設定を取る
+    FMinimalViewInfo View;
+    Camera->GetCameraView(0.0f, View);
+    OutSettings = View.PostProcessSettings;
+    return true;
+}
+
+namespace
+{
+    /**
+     * UE の手動露出と同じ式で「シーン値 → カメラで 1.0 になる値」の倍率を求める。
+     * PostProcessEyeAdaptation.cpp: ExposureScale = 0.18 / (LuminanceMax * 2^EV100) * 2^Bias
+     */
+    float ComputeManualExposureScale(float EV100, float Bias)
+    {
+        float LuminanceMax = 1.0f;
+        const IConsoleVariable *ExtendRange = IConsoleManager::Get().FindConsoleVariable(TEXT("r.DefaultFeature.AutoExposure.ExtendDefaultLuminanceRange"));
+        const IConsoleVariable *LensAttenuation = IConsoleManager::Get().FindConsoleVariable(TEXT("r.EyeAdaptation.LensAttenuation"));
+        if (ExtendRange && ExtendRange->GetInt() != 0 && LensAttenuation)
+        {
+            LuminanceMax = 0.78f / FMath::Max(LensAttenuation->GetFloat(), 0.01f);
+        }
+        const float WhitePointLuminance = LuminanceMax * FMath::Pow(2.0f, EV100);
+        return 0.18f / FMath::Max(WhitePointLuminance, 1e-6f) * FMath::Pow(2.0f, Bias);
+    }
+
+    /** 物理カメラ設定からの EV100 (CalculateManualAutoExposure と同じ式) */
+    float PhysicalCameraEV100(const FPostProcessSettings &Settings)
+    {
+        if (!Settings.AutoExposureApplyPhysicalCameraExposure)
+        {
+            return 0.0f;
+        }
+        return FMath::Log2(FMath::Square(Settings.DepthOfFieldFstop) * Settings.CameraShutterSpeed * 100.0f /
+                           FMath::Max(1.0f, Settings.CameraISO));
     }
 }
 
-FLinearColor ALightProbeActor::ApplyColorOnlyMode(const FLinearColor& InputColor) const
+FLightSyncSampleContext ALightProbeActor::ApplyCaptureSettings()
 {
-    if (!bColorOnly)
+    FLightSyncSampleContext Context;
+    Context.ProbeRotation = GetActorQuat();
+
+    if (!SceneCapture)
     {
-        return InputColor;
+        return Context;
     }
 
-    FLinearColor OutputColor = InputColor;
-    const float MaxComp = FMath::Max3(OutputColor.R, OutputColor.G, OutputColor.B);
-    
-    if (MaxComp > ColorOnlyBlackThreshold)
+    FEngineShowFlags &Flags = SceneCapture->ShowFlags;
+
+    // 色ではなく「像」に効くエフェクトは常に無効 (照明の色・強さとは無関係で、積分値を歪める)
+    Flags.SetAntiAliasing(false);
+    Flags.SetTemporalAA(false);
+    Flags.SetMotionBlur(false);
+    Flags.SetDepthOfField(false);
+    Flags.SetBloom(false);
+    Flags.SetLensFlares(false);
+    Flags.SetVignette(false);
+    Flags.SetGrain(false);
+
+    // 光の見え方に効くものはメインビューと同じく有効
+    Flags.SetFog(true);
+    Flags.SetVolumetricFog(true);
+    Flags.SetAmbientOcclusion(true);
+
+    FPostProcessSettings CameraPP;
+    const bool bHasCamera = GetReferenceCameraPostProcess(CameraPP);
+
+    if (bHasCamera && CameraPP.AutoExposureMethod != EAutoExposureMethod::AEM_Manual && !bWarnedAutoExposure)
     {
-        // max(R,G,B) = 1.0 に正規化 → 純粋な色だけ
-        OutputColor.R /= MaxComp;
-        OutputColor.G /= MaxComp;
-        OutputColor.B /= MaxComp;
+        UE_LOG(LogLightSyncDMX, Warning,
+               TEXT("LightProbe '%s': 参照カメラの露出が Manual ではありません。プローブは Manual として計算します (ICVFX では Manual 露出を推奨)。"),
+               *ProbeName);
+        bWarnedAutoExposure = true;
+    }
+
+    const float EV100 = bHasCamera ? PhysicalCameraEV100(CameraPP) : ManualEV100;
+    const float Bias = bHasCamera ? CameraPP.AutoExposureBias : ManualExposureBias;
+    EffectiveExposureScale = ComputeManualExposureScale(EV100, Bias);
+
+    if (ReferenceMode == ELightSyncReferenceMode::Wall)
+    {
+        // 露出・グレーディング・トーンカーブ適用後の値 (sRGB 原色)。
+        // 実測で、この値は nDisplay が壁へ送る信号 (LDR のコード値 / 255) と一致する = 表示用にエンコード済み。
+        // 壁が出す光は EOTF(信号) なので、texel ごとに WallDisplayEOTF でデコードしてから積分する
+        SceneCapture->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
+        Flags.SetPostProcessing(true);
+        Flags.SetTonemapper(true);
+        Flags.SetColorGrading(true);
+        Flags.SetEyeAdaptation(true);
+
+        FPostProcessSettings PP = bHasCamera ? CameraPP : FPostProcessSettings();
+
+        // 露出は必ず手動に固定 (キューブキャプチャが自分の中身に自動露出しないように)。
+        // 物理カメラ分は Bias に畳み込む: 0.18 * 2^(Bias - EV100) と同じ倍率になる
+        PP.bOverride_AutoExposureMethod = true;
+        PP.AutoExposureMethod = EAutoExposureMethod::AEM_Manual;
+        PP.bOverride_AutoExposureApplyPhysicalCameraExposure = true;
+        PP.AutoExposureApplyPhysicalCameraExposure = false;
+        PP.bOverride_AutoExposureBias = true;
+        PP.AutoExposureBias = Bias - EV100;
+
+        SceneCapture->PostProcessSettings = PP;
+        SceneCapture->PostProcessBlendWeight = 1.0f;
+
+        Context.ExposureScale = OutputGain; // 露出はエンジンが適用済み
+        Context.bInputIsSRGBGamut = true;
+        Context.InputTransfer = WallDisplayEOTF;
     }
     else
     {
-        // 暗すぎる場合はブラックを送信
-        OutputColor = FLinearColor::Black;
+        // トーンマップ前の放射輝度 (作業色空間)。露出はプローブ側で掛ける
+        SceneCapture->CaptureSource = ESceneCaptureSource::SCS_SceneColorHDR;
+        Flags.SetEyeAdaptation(false);
+        SceneCapture->PostProcessSettings = FPostProcessSettings();
+        SceneCapture->PostProcessBlendWeight = 0.0f;
+
+        Context.ExposureScale = EffectiveExposureScale * OutputGain;
+        Context.bInputIsSRGBGamut = false;
     }
-    
-    return OutputColor;
+
+    return Context;
 }
+
 
 void ALightProbeActor::InitializeCapture()
 {
@@ -422,106 +500,7 @@ void ALightProbeActor::UpdateRenderTarget()
            *ProbeName, CaptureResolution, CaptureResolution);
 }
 
-FLinearColor ALightProbeActor::ApplyColorCorrection(const FLinearColor &RawColor) const
-{
-    FLinearColor Result = RawColor;
 
-    // --- ガンマ補正 ---
-    if (!FMath::IsNearlyEqual(GammaCorrection, 1.0f))
-    {
-        const float InvGamma = 1.0f / FMath::Max(GammaCorrection, 0.01f);
-        Result.R = FMath::Pow(FMath::Max(Result.R, 0.0f), InvGamma);
-        Result.G = FMath::Pow(FMath::Max(Result.G, 0.0f), InvGamma);
-        Result.B = FMath::Pow(FMath::Max(Result.B, 0.0f), InvGamma);
-    }
-
-    // --- 色温度オフセット ---
-    if (!FMath::IsNearlyZero(ColorTemperatureOffset))
-    {
-        // 基準6500K + オフセット でRGB係数を得る
-        const FLinearColor TempTint = ColorTemperatureToRGB(6500.0f + ColorTemperatureOffset);
-        Result.R *= TempTint.R;
-        Result.G *= TempTint.G;
-        Result.B *= TempTint.B;
-    }
-
-    // --- 彩度調整 ---
-    if (!FMath::IsNearlyEqual(SaturationMultiplier, 1.0f))
-    {
-        // 輝度計算 (Rec.709)
-        const float Luminance = 0.2126f * Result.R + 0.7152f * Result.G + 0.0722f * Result.B;
-        Result.R = FMath::Lerp(Luminance, Result.R, SaturationMultiplier);
-        Result.G = FMath::Lerp(Luminance, Result.G, SaturationMultiplier);
-        Result.B = FMath::Lerp(Luminance, Result.B, SaturationMultiplier);
-    }
-
-    // --- 明度調整 ---
-    Result.R *= BrightnessMultiplier;
-    Result.G *= BrightnessMultiplier;
-    Result.B *= BrightnessMultiplier;
-
-    // クランプ
-    Result.R = FMath::Clamp(Result.R, 0.0f, 1.0f);
-    Result.G = FMath::Clamp(Result.G, 0.0f, 1.0f);
-    Result.B = FMath::Clamp(Result.B, 0.0f, 1.0f);
-    Result.A = 1.0f;
-
-    return Result;
-}
-
-FLinearColor ALightProbeActor::ColorTemperatureToRGB(float TempKelvin)
-{
-    // Tanner Helland's algorithm を使用した色温度→RGB変換
-    // http://www.tannerhelland.com/4435/convert-temperature-rgb-algorithm-code/
-
-    TempKelvin = FMath::Clamp(TempKelvin, 1000.0f, 40000.0f) / 100.0f;
-
-    float R, G, B;
-
-    // Red
-    if (TempKelvin <= 66.0f)
-    {
-        R = 1.0f;
-    }
-    else
-    {
-        R = TempKelvin - 60.0f;
-        R = 329.698727446f * FMath::Pow(R, -0.1332047592f);
-        R = FMath::Clamp(R / 255.0f, 0.0f, 1.0f);
-    }
-
-    // Green
-    if (TempKelvin <= 66.0f)
-    {
-        G = TempKelvin;
-        G = 99.4708025861f * FMath::Loge(G) - 161.1195681661f;
-        G = FMath::Clamp(G / 255.0f, 0.0f, 1.0f);
-    }
-    else
-    {
-        G = TempKelvin - 60.0f;
-        G = 288.1221695283f * FMath::Pow(G, -0.0755148492f);
-        G = FMath::Clamp(G / 255.0f, 0.0f, 1.0f);
-    }
-
-    // Blue
-    if (TempKelvin >= 66.0f)
-    {
-        B = 1.0f;
-    }
-    else if (TempKelvin <= 19.0f)
-    {
-        B = 0.0f;
-    }
-    else
-    {
-        B = TempKelvin - 10.0f;
-        B = 138.5177312231f * FMath::Loge(B) - 305.0447927307f;
-        B = FMath::Clamp(B / 255.0f, 0.0f, 1.0f);
-    }
-
-    return FLinearColor(R, G, B, 1.0f);
-}
 
 #if WITH_EDITOR
 void ALightProbeActor::PostEditChangeProperty(FPropertyChangedEvent &PropertyChangedEvent)

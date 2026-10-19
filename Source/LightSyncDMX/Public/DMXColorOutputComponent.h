@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "DMXProtocolCommon.h"
+#include "LightSyncZones.h"
 #include "DMXColorOutputComponent.generated.h"
 
 class UDMXLibrary;
@@ -42,6 +43,10 @@ struct LIGHTSYNCDMX_API FDMXFixtureMapping
     /** フィクスチャ名 (識別用) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX")
     FString FixtureName = TEXT("LED_01");
+
+    /** このフィクスチャが再現するゾーン (プローブの Color Sampler → Zones の Name) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX")
+    FName Zone = TEXT("Average");
 
     /** DMXユニバース番号 */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX", meta = (ClampMin = "1", ClampMax = "64000"))
@@ -134,9 +139,13 @@ public:
 
     // === メソッド ===
 
-    /** 色をDMXとして送信 */
+    /** 色をDMXとして全フィクスチャに送信 (ゾーンに関係なく同じ色) */
     UFUNCTION(BlueprintCallable, Category = "DMX")
     void SendColor(const FLinearColor &Color);
+
+    /** 各フィクスチャに、マッピングで指定したゾーンの色を送信 */
+    UFUNCTION(BlueprintCallable, Category = "DMX")
+    void SendZoneColors(const TArray<FLightSyncZoneResult> &ZoneResults);
 
     /** 特定のフィクスチャのみに色を送信 */
     UFUNCTION(BlueprintCallable, Category = "DMX")
@@ -194,4 +203,7 @@ private:
 
     /** 範囲外 (512ch超え) 警告済みのフィクスチャ名 */
     TSet<FString> WarnedOutOfRangeFixtures;
+
+    /** 存在しないゾーンを指定している警告済みのフィクスチャ名 */
+    TSet<FString> WarnedMissingZoneFixtures;
 };

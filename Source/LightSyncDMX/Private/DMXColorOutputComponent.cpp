@@ -58,6 +58,43 @@ void UDMXColorOutputComponent::SendColor(const FLinearColor &Color)
     SentFrameCount++;
 }
 
+void UDMXColorOutputComponent::SendZoneColors(const TArray<FLightSyncZoneResult> &ZoneResults)
+{
+    if (!bDMXOutputEnabled)
+    {
+        return;
+    }
+
+    for (const FDMXFixtureMapping &Mapping : FixtureMappings)
+    {
+        if (!Mapping.bEnabled)
+        {
+            continue;
+        }
+
+        const FLightSyncZoneResult *Found = ZoneResults.FindByPredicate(
+            [&Mapping](const FLightSyncZoneResult &Result) { return Result.Name == Mapping.Zone; });
+
+        if (!Found)
+        {
+            // 結果が出る前 (起動直後) は黙ってスキップ。結果があるのに見つからないときだけ警告
+            if (ZoneResults.Num() > 0 && !WarnedMissingZoneFixtures.Contains(Mapping.FixtureName))
+            {
+                UE_LOG(LogLightSyncDMX, Warning, TEXT("DMXColorOutput: フィクスチャ '%s' のゾーン '%s' がプローブにありません。"),
+                       *Mapping.FixtureName, *Mapping.Zone.ToString());
+                WarnedMissingZoneFixtures.Add(Mapping.FixtureName);
+            }
+            continue;
+        }
+        WarnedMissingZoneFixtures.Remove(Mapping.FixtureName);
+
+        SendDMXData(Mapping, Found->Color);
+        LastSentColor = Found->Color;
+    }
+
+    SentFrameCount++;
+}
+
 void UDMXColorOutputComponent::SendColorToFixture(const FLinearColor &Color, int32 FixtureIndex)
 {
     if (!bDMXOutputEnabled || !FixtureMappings.IsValidIndex(FixtureIndex))
@@ -211,10 +248,18 @@ TMap<int32, uint8> UDMXColorOutputComponent::ColorToDMXChannels(
         return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Value * 255.0f), 0, 255));
     };
 
-    // 明度スケーリング適用
-    float R = FMath::Clamp(Color.R * Mapping.BrightnessScale * MasterDimmer, 0.0f, 1.0f);
-    float G = FMath::Clamp(Color.G * Mapping.BrightnessScale * MasterDimmer, 0.0f, 1.0f);
-    float B = FMath::Clamp(Color.B * Mapping.BrightnessScale * MasterDimmer, 0.0f, 1.0f);
+    // 明度スケーリング適用。上限を超えたら全チャンネルを同じ比率で下げて色相を保つ
+    const float Gain = Mapping.BrightnessScale * MasterDimmer;
+    float R = FMath::Max(Color.R * Gain, 0.0f);
+    float G = FMath::Max(Color.G * Gain, 0.0f);
+    float B = FMath::Max(Color.B * Gain, 0.0f);
+    const float PeakComp = FMath::Max3(R, G, B);
+    if (PeakComp > 1.0f)
+    {
+        R /= PeakComp;
+        G /= PeakComp;
+        B /= PeakComp;
+    }
 
     const int32 Ch = Mapping.StartChannel;
 

@@ -21,46 +21,129 @@
 #include "DataDrivenShaderPlatformInfo.h"
 
 // ============================================================
-// FLightSyncAverageCS — Global Compute Shader 宣言
+// Compute Shader 宣言 (LightSyncAverageCS.usf の 2 エントリポイント)
 // ============================================================
 
-class FLightSyncAverageCS : public FGlobalShader
-{
-    DECLARE_GLOBAL_SHADER(FLightSyncAverageCS);
-    SHADER_USE_PARAMETER_STRUCT(FLightSyncAverageCS, FGlobalShader);
+BEGIN_SHADER_PARAMETER_STRUCT(FLightSyncZoneShaderParameters, )
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(TextureCube, InputCube)
+    SHADER_PARAMETER_SAMPLER(SamplerState, InputSampler)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVector4f>, OutputBuffer)
+    SHADER_PARAMETER(uint32, TextureSize)
+    SHADER_PARAMETER(uint32, FaceIndex)
+    SHADER_PARAMETER(uint32, NumZones)
+    SHADER_PARAMETER(float, PartitionSharpness)
+    SHADER_PARAMETER(FVector3f, LuminanceCoeffs)
+    SHADER_PARAMETER(float, KeyRefineCos)
+    SHADER_PARAMETER(uint32, InputTransfer)
+    SHADER_PARAMETER_ARRAY(FVector4f, ZoneDirShape, [LightSyncZones::MaxZones])
+    SHADER_PARAMETER_ARRAY(FVector4f, ZoneParams, [LightSyncZones::MaxZones])
+END_SHADER_PARAMETER_STRUCT()
 
-    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-        SHADER_PARAMETER_RDG_TEXTURE_SRV(TextureCube, InputCube)
-        SHADER_PARAMETER_SAMPLER(SamplerState, InputSampler)
-        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVector4f>, OutputBuffer)
-        SHADER_PARAMETER(uint32, TextureSize)
-        SHADER_PARAMETER(uint32, FaceIndex)
-        SHADER_PARAMETER(float,  LuminanceExponent)
-        SHADER_PARAMETER(float,  DarkThreshold)
-        SHADER_PARAMETER(float,  HDRClamp)
-        SHADER_PARAMETER(float,  DirectLightThreshold)
-        SHADER_PARAMETER(uint32, bFilterDirectLight)
-    END_SHADER_PARAMETER_STRUCT()
+class FLightSyncPeakCS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FLightSyncPeakCS);
+    SHADER_USE_PARAMETER_STRUCT(FLightSyncPeakCS, FGlobalShader);
+    using FParameters = FLightSyncZoneShaderParameters;
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
         return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
     }
+};
 
-    static void ModifyCompilationEnvironment(
-        const FGlobalShaderPermutationParameters& Parameters,
-        FShaderCompilerEnvironment& OutEnvironment)
+class FLightSyncRefineCS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FLightSyncRefineCS);
+    SHADER_USE_PARAMETER_STRUCT(FLightSyncRefineCS, FGlobalShader);
+    using FParameters = FLightSyncZoneShaderParameters;
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
-        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-        OutEnvironment.SetDefine(TEXT("LIGHTSYNC_THREADGROUP_SIZE"), 8);
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
     }
 };
 
-IMPLEMENT_GLOBAL_SHADER(
-    FLightSyncAverageCS,
-    "/LightSyncDMX/Private/LightSyncAverageCS.usf",
-    "MainCS",
-    SF_Compute);
+class FLightSyncZonesCS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FLightSyncZonesCS);
+    SHADER_USE_PARAMETER_STRUCT(FLightSyncZonesCS, FGlobalShader);
+    using FParameters = FLightSyncZoneShaderParameters;
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FLightSyncPeakCS, "/LightSyncDMX/Private/LightSyncAverageCS.usf", "MainPeakCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FLightSyncRefineCS, "/LightSyncDMX/Private/LightSyncAverageCS.usf", "MainRefineCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FLightSyncZonesCS, "/LightSyncDMX/Private/LightSyncAverageCS.usf", "MainZonesCS", SF_Compute);
+
+// ============================================================
+// ヘルパー
+// ============================================================
+
+namespace
+{
+    /** 出力バッファ → ゾーン結果 (6 面を合計) */
+    LightSyncZones::FResult DecodeOutput(const FVector4f* Data, int32 NumZones)
+    {
+        LightSyncZones::FResult Result;
+        Result.Zones.SetNumZeroed(NumZones);
+
+        FVector4f Peak = Data[0];
+        for (int32 Face = 1; Face < 6; ++Face)
+        {
+            if (Data[Face].W > Peak.W)
+            {
+                Peak = Data[Face];
+            }
+        }
+        FVector4f Refine(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int32 Face = 0; Face < 6; ++Face)
+        {
+            Refine += Data[FLightSyncGPUSampler::RefineBase + Face];
+        }
+        const FVector3f RefineDir(Refine.X, Refine.Y, Refine.Z);
+        Result.KeyDirection = (Refine.W > 0.0f && !RefineDir.IsNearlyZero()) ? RefineDir.GetSafeNormal() : FVector3f(Peak.X, Peak.Y, Peak.Z);
+        Result.KeyLuminance = FMath::Max(Peak.W, 0.0f);
+
+        for (int32 Zone = 0; Zone < NumZones; ++Zone)
+        {
+            FVector4f Sum(0.0f, 0.0f, 0.0f, 0.0f);
+            for (int32 Face = 0; Face < 6; ++Face)
+            {
+                Sum += Data[FLightSyncGPUSampler::ZonesBase + Face * LightSyncZones::MaxZones + Zone];
+            }
+            Result.Zones[Zone] = Sum;
+        }
+        return Result;
+    }
+
+    void FillShaderParameters(FLightSyncZoneShaderParameters& P, const LightSyncZones::FSetup& Setup)
+    {
+        P.NumZones = static_cast<uint32>(FMath::Min(Setup.Zones.Num(), LightSyncZones::MaxZones));
+        P.PartitionSharpness = Setup.PartitionSharpness;
+        P.LuminanceCoeffs = Setup.LuminanceCoeffs;
+        P.KeyRefineCos = Setup.KeyRefineCos;
+        P.InputTransfer = static_cast<uint32>(Setup.InputTransfer);
+
+        for (int32 Index = 0; Index < LightSyncZones::MaxZones; ++Index)
+        {
+            if (Setup.Zones.IsValidIndex(Index))
+            {
+                const LightSyncZones::FZoneDesc& Zone = Setup.Zones[Index];
+                P.ZoneDirShape[Index] = FVector4f(Zone.Direction, static_cast<float>(static_cast<uint8>(Zone.Shape)));
+                P.ZoneParams[Index] = FVector4f(Zone.CosOuter, Zone.CosInner, Zone.bShared ? 1.0f : 0.0f, 0.0f);
+            }
+            else
+            {
+                P.ZoneDirShape[Index] = FVector4f(0.0f, 0.0f, 1.0f, 0.0f);
+                P.ZoneParams[Index] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+    }
+}
 
 // ============================================================
 // FLightSyncGPUSampler 実装
@@ -98,11 +181,8 @@ void FLightSyncGPUSampler::Initialize()
 
     ReadbackState = MakeShared<FReadbackSharedState, ESPMode::ThreadSafe>();
     FMemory::Memzero(ReadbackState->RawData, sizeof(ReadbackState->RawData));
-    ReadbackState->RawParams = Params;
-    ReadbackState->bDataReady = false;
-    InFlightParams = Params;
-    bDispatched    = false;
-    bInitialized   = true;
+    bDispatched  = false;
+    bInitialized = true;
 }
 
 void FLightSyncGPUSampler::SetForceCPUSync(bool bInForceCPUSync)
@@ -114,6 +194,7 @@ void FLightSyncGPUSampler::SetForceCPUSync(bool bInForceCPUSync)
 
     bForceCPUSync = bInForceCPUSync;
     bDispatched = false;
+    bCPUResultPending = false;
 
     if (ReadbackState)
     {
@@ -134,9 +215,9 @@ void FLightSyncGPUSampler::Release()
     ReadbackBuffer.Reset();
     ReadbackState.Reset();
 
-    bInitialized     = false;
-    bDispatched      = false;
-    bResultReady     = false;
+    bInitialized      = false;
+    bDispatched       = false;
+    bCPUResultPending = false;
 
     UE_LOG(LogLightSyncDMX, Log, TEXT("LightSyncGPUSampler released"));
 }
@@ -154,23 +235,22 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
 
     if (ShouldUseCPUPath())
     {
-        // CPU 同期フォールバック: 結果はこの呼び出しで即座に Cached* に書き込まれる
-        ComputeAverageColor_CPUSync(CubeRT);
+        ComputeCPU(CubeRT);
         return;
     }
 
-    // --- 前フレームのリードバックをレンダースレッドでポーリングする ---
+    // --- 進行中のリードバックをレンダースレッドでポーリングする ---
     // IsReady/Lock/Unlock は必ずレンダースレッドから呼ぶ。
-    // 結果を共有状態に書き込み、ゲームスレッドは TryGetResult() で取得する。
     if (bDispatched)
     {
-        bool bNeedsPoll = false;
         TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> SharedState = ReadbackState;
-        if (!SharedState.IsValid())
+        TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackPtr = ReadbackBuffer;
+        if (!SharedState.IsValid() || !ReadbackPtr.IsValid())
         {
             return;
         }
 
+        bool bNeedsPoll = false;
         {
             FScopeLock Lock(&SharedState->Lock);
             bNeedsPoll = !SharedState->bDataReady;
@@ -178,22 +258,19 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
 
         if (bNeedsPoll)
         {
-            TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackPtr = ReadbackBuffer;
-            const FSamplingParams  ResultParams = InFlightParams;
-
+            const int32 NumZones = InFlightNumZones;
             ENQUEUE_RENDER_COMMAND(LightSyncPollReadback)(
-                [ReadbackPtr, SharedState, ResultParams]
-                (FRHICommandListImmediate& /*RHICmdList*/)
+                [ReadbackPtr, SharedState, NumZones](FRHICommandListImmediate& /*RHICmdList*/)
                 {
-                    if (ReadbackPtr.IsValid() && ReadbackPtr->IsReady())
+                    if (ReadbackPtr->IsReady())
                     {
                         const FVector4f* Src = static_cast<const FVector4f*>(
-                            ReadbackPtr->Lock(12 * sizeof(FVector4f)));
+                            ReadbackPtr->Lock(NumOutputElements * sizeof(FVector4f)));
                         if (Src)
                         {
                             FScopeLock Lock(&SharedState->Lock);
-                            FMemory::Memcpy(SharedState->RawData, Src, 12 * sizeof(FVector4f));
-                            SharedState->RawParams = ResultParams;
+                            FMemory::Memcpy(SharedState->RawData, Src, NumOutputElements * sizeof(FVector4f));
+                            SharedState->NumZones = NumZones;
                             SharedState->bDataReady = true;
                         }
                         ReadbackPtr->Unlock();
@@ -201,452 +278,172 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
                 });
         }
 
-        // 前回の AddEnqueueCopyPass が未取得の間は同じ ReadbackBuffer に
-        // 新しいコピーを積まない。
+        // 前回のコピーが未取得の間は同じ ReadbackBuffer に新しいコピーを積まない
         return;
     }
 
-    // --- GPU テクスチャ参照をゲームスレッドで取得 ---
     FTextureResource* TexResource = CubeRT->GetResource();
-    if (!TexResource || !TexResource->TextureRHI)
+    TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackPtr = ReadbackBuffer;
+    if (!TexResource || !TexResource->TextureRHI || !ReadbackPtr.IsValid())
     {
-        ComputeAverageColor_CPUSync(CubeRT);
+        ComputeCPU(CubeRT);
         return;
     }
 
     FTextureRHIRef CubeTextureRHI = TexResource->TextureRHI;
-
     const uint32 TexSize = static_cast<uint32>(CubeRT->SizeX);
-    const FSamplingParams CapturedParams = Params;
-    TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackPtr = ReadbackBuffer;
-    if (!ReadbackPtr.IsValid())
-    {
-        ComputeAverageColor_CPUSync(CubeRT);
-        return;
-    }
+    const LightSyncZones::FSetup CapturedSetup = Setup;
 
     bDispatched = true;
-    InFlightParams = CapturedParams;
+    InFlightNumZones = FMath::Min(CapturedSetup.Zones.Num(), LightSyncZones::MaxZones);
 
     ENQUEUE_RENDER_COMMAND(LightSyncDispatchCS)(
-        [CubeTextureRHI, TexSize, CapturedParams, ReadbackPtr]
-        (FRHICommandListImmediate& RHICmdList)
+        [CubeTextureRHI, TexSize, CapturedSetup, ReadbackPtr](FRHICommandListImmediate& RHICmdList)
         {
-            // シェーダーが有効か確認
-            TShaderMapRef<FLightSyncAverageCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-            if (!CS.IsValid())
+            FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+            TShaderMapRef<FLightSyncPeakCS> PeakCS(ShaderMap);
+            TShaderMapRef<FLightSyncRefineCS> RefineCS(ShaderMap);
+            TShaderMapRef<FLightSyncZonesCS> ZonesCS(ShaderMap);
+            if (!PeakCS.IsValid() || !RefineCS.IsValid() || !ZonesCS.IsValid())
             {
                 return;
             }
 
             FRDGBuilder GraphBuilder(RHICmdList);
 
-            // CubeMap テクスチャを RDG に登録
             FRDGTextureRef CubeTex = GraphBuilder.RegisterExternalTexture(
                 CreateRenderTarget(CubeTextureRHI, TEXT("LS_CubeRT")));
+            FRDGTextureSRVRef CubeSRV = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(CubeTex));
 
-            // TextureCube SRV を作成
-            FRDGTextureSRVRef CubeSRV = GraphBuilder.CreateSRV(
-                FRDGTextureSRVDesc::Create(CubeTex));
-
-            // 出力用構造化バッファ (12 × float4)
             FRDGBufferRef OutputBuf = GraphBuilder.CreateBuffer(
-                FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), 12),
-                TEXT("LS_OutputBuf"));
-
+                FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), NumOutputElements),
+                TEXT("LS_ZoneOutput"));
             FRDGBufferUAVRef OutputUAV = GraphBuilder.CreateUAV(OutputBuf);
 
-            // 6 面分をディスパッチ
+            auto MakeParams = [&](uint32 FaceIdx)
+            {
+                FLightSyncZoneShaderParameters* P = GraphBuilder.AllocParameters<FLightSyncZoneShaderParameters>();
+                P->InputCube    = CubeSRV;
+                P->InputSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+                P->OutputBuffer = OutputUAV;
+                P->TextureSize  = TexSize;
+                P->FaceIndex    = FaceIdx;
+                FillShaderParameters(*P, CapturedSetup);
+                return P;
+            };
+
+            // Pass 1: 面ごとのピーク (Key ゾーン用)
             for (uint32 FaceIdx = 0; FaceIdx < 6; ++FaceIdx)
             {
-                FLightSyncAverageCS::FParameters* P =
-                    GraphBuilder.AllocParameters<FLightSyncAverageCS::FParameters>();
-
-                P->InputCube         = CubeSRV;
-                P->InputSampler      = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-                P->OutputBuffer      = OutputUAV;
-                P->TextureSize       = TexSize;
-                P->FaceIndex         = FaceIdx;
-                P->LuminanceExponent     = CapturedParams.LuminanceExponent;
-                P->DarkThreshold         = CapturedParams.DarkThreshold;
-                P->HDRClamp              = CapturedParams.HDRClamp;
-                P->DirectLightThreshold  = CapturedParams.DirectLightThreshold;
-                P->bFilterDirectLight    = CapturedParams.bFilterDirectLight ? 1u : 0u;
-
-                FComputeShaderUtils::AddPass(
-                    GraphBuilder,
-                    RDG_EVENT_NAME("LightSync_Face%u", FaceIdx),
-                    ERDGPassFlags::Compute,
-                    CS,
-                    P,
-                    FIntVector(1, 1, 1));
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Peak%u", FaceIdx),
+                                             ERDGPassFlags::Compute, PeakCS, MakeParams(FaceIdx), FIntVector(1, 1, 1));
             }
 
-            // 結果をリードバックバッファにコピー (GPU → CPU ステージング)
-            AddEnqueueCopyPass(GraphBuilder, ReadbackPtr.Get(), OutputBuf,
-                               12 * sizeof(FVector4f));
+            // Pass 2: Key 方向の精密化 (Pass 1 の結果を同じバッファから読む。RDG が UAV バリアを入れる)
+            for (uint32 FaceIdx = 0; FaceIdx < 6; ++FaceIdx)
+            {
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Refine%u", FaceIdx),
+                                             ERDGPassFlags::Compute, RefineCS, MakeParams(FaceIdx), FIntVector(1, 1, 1));
+            }
+
+            // Pass 3: ゾーン積分
+            for (uint32 FaceIdx = 0; FaceIdx < 6; ++FaceIdx)
+            {
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Zones%u", FaceIdx),
+                                             ERDGPassFlags::Compute, ZonesCS, MakeParams(FaceIdx), FIntVector(1, 1, 1));
+            }
+
+            AddEnqueueCopyPass(GraphBuilder, ReadbackPtr.Get(), OutputBuf, NumOutputElements * sizeof(FVector4f));
 
             GraphBuilder.Execute();
         });
 }
 
 // ============================================================
-// TryGetResult
+// TryGetNewResult
 // ============================================================
 
-bool FLightSyncGPUSampler::TryGetResult(
-    FLinearColor& OutAverageColor,
-    FLinearColor& OutTopColor,
-    FLinearColor& OutSideColor,
-    FLinearColor& OutDominantColor)
+bool FLightSyncGPUSampler::TryGetNewResult(LightSyncZones::FResult& OutResult)
 {
-    // CPU パス: DispatchSampling() で即時書き込み済み
     if (ShouldUseCPUPath())
     {
-        if (bResultReady)
+        if (bCPUResultPending)
         {
-            OutAverageColor  = CachedAverageColor;
-            OutTopColor      = CachedTopColor;
-            OutSideColor     = CachedSideColor;
-            OutDominantColor = CachedDominantColor;
+            OutResult = CPUResult;
+            bCPUResultPending = false;
             return true;
         }
         return false;
     }
 
-    // GPU パス: レンダースレッドがデータを書き込んでいれば取得する
-    // (IsReady/Lock/Unlock はレンダースレッドの ENQUEUE_RENDER_COMMAND 内で行う)
+    TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> SharedState = ReadbackState;
+    if (!SharedState.IsValid())
     {
-        TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> SharedState = ReadbackState;
-        if (SharedState.IsValid())
-        {
-            FScopeLock Lock(&SharedState->Lock);
-            if (SharedState->bDataReady)
-            {
-                ProcessReadbackData(SharedState->RawData, SharedState->RawParams);
-                SharedState->bDataReady = false;
-                bDispatched             = false;
-                bResultReady            = true;
-            }
-        }
+        return false;
     }
 
-    // キャッシュに有効な結果があれば返す (まだ未完了でも前フレームの値を維持)
-    if (bResultReady)
+    FScopeLock Lock(&SharedState->Lock);
+    if (!SharedState->bDataReady)
     {
-        OutAverageColor  = CachedAverageColor;
-        OutTopColor      = CachedTopColor;
-        OutSideColor     = CachedSideColor;
-        OutDominantColor = CachedDominantColor;
-        return true;
+        return false;
     }
 
-    return false;
+    OutResult = DecodeOutput(SharedState->RawData, SharedState->NumZones);
+    SharedState->bDataReady = false;
+    bDispatched = false;
+    return true;
 }
 
 // ============================================================
-// ProcessReadbackData — GPU 結果をポスト処理
+// CPU 経路
 // ============================================================
 
-void FLightSyncGPUSampler::ProcessReadbackData(const FVector4f* Data, const FSamplingParams& ResultParams)
+bool FLightSyncGPUSampler::ReadCubeTexels(UTextureRenderTargetCube* CubeRT, TArray<FLinearColor> (&OutFaces)[6], int32& OutSize)
 {
-    // 面設定ウェイト (UE5 は Z-up: +Z=天頂, -Z=床)
-    const float FaceWeights[6] = {
-        ResultParams.SideFaceWeight,    // +X
-        ResultParams.SideFaceWeight,    // -X
-        ResultParams.SideFaceWeight,    // +Y
-        ResultParams.SideFaceWeight,    // -Y
-        ResultParams.TopFaceWeight,     // +Z (Top: 空/天井)
-        ResultParams.BottomFaceWeight,  // -Z (Bottom: 床)
-    };
-
-    // --- 全体平均 ---
-    // Data[i] = (R*w, G*w, B*w, totalLumWeight)
-    // 設定ウェイト FaceWeights[i] で面間の寄与率を調整する。
-    // FaceColors[i] はすでに輝度加重済みなので de-weight してから再ウェイトする。
-    {
-        FVector4f Acc   = FVector4f(0,0,0,0);
-        float     Total = 0.0f;
-        for (int32 i = 0; i < 6; ++i)
-        {
-            float LumW  = Data[i].W; // 輝度加重の合計
-            float FaceW = FaceWeights[i];
-            if (LumW > KINDA_SMALL_NUMBER && FaceW > KINDA_SMALL_NUMBER)
-            {
-                // 輝度加重平均を de-weight して純粋な面平均を得る
-                FVector4f FaceAvg = Data[i] / LumW;
-                Acc.X += FaceAvg.X * FaceW;
-                Acc.Y += FaceAvg.Y * FaceW;
-                Acc.Z += FaceAvg.Z * FaceW;
-                Total += FaceW;
-            }
-        }
-        CachedAverageColor = (Total > KINDA_SMALL_NUMBER)
-            ? FLinearColor(Acc.X / Total, Acc.Y / Total, Acc.Z / Total, 1.0f)
-            : FLinearColor::Black;
-    }
-
-    // --- Top (面インデックス 4: +Z = UE5 の天頂方向) ---
-    {
-        float W = Data[4].W;
-        CachedTopColor = (W > KINDA_SMALL_NUMBER)
-            ? FLinearColor(Data[4].X / W, Data[4].Y / W, Data[4].Z / W, 1.0f)
-            : FLinearColor::Black;
-    }
-
-    // --- Side (faces 0, 1, 2, 3: ±X, ±Y) ---
-    {
-        constexpr int32 SideFaceIdx[] = {0, 1, 2, 3};
-        FVector4f Acc   = FVector4f(0,0,0,0);
-        float     Total = 0.0f;
-        for (int32 Idx : SideFaceIdx)
-        {
-            float LumW  = Data[Idx].W;
-            float FaceW = FaceWeights[Idx];
-            if (LumW > KINDA_SMALL_NUMBER && FaceW > KINDA_SMALL_NUMBER)
-            {
-                FVector4f FaceAvg = Data[Idx] / LumW;
-                Acc.X += FaceAvg.X * FaceW;
-                Acc.Y += FaceAvg.Y * FaceW;
-                Acc.Z += FaceAvg.Z * FaceW;
-                Total += FaceW;
-            }
-        }
-        CachedSideColor = (Total > KINDA_SMALL_NUMBER)
-            ? FLinearColor(Acc.X / Total, Acc.Y / Total, Acc.Z / Total, 1.0f)
-            : FLinearColor::Black;
-    }
-
-    // --- Dominant (全 6 面で最大輝度のピクセル) ---
-    // Data[6+i] = (R, G, B, luminance) of the brightest pixel on face i
-    {
-        int32 BestFace = -1;
-        float BestLum  = -1.0f;
-        for (int32 i = 0; i < 6; ++i)
-        {
-            float Lum = Data[6 + i].W;
-            if (Lum > BestLum)
-            {
-                BestLum  = Lum;
-                BestFace = i;
-            }
-        }
-        CachedDominantColor = (BestFace >= 0 && BestLum > 0.0f)
-            ? FLinearColor(Data[6 + BestFace].X, Data[6 + BestFace].Y, Data[6 + BestFace].Z, 1.0f)
-            : FLinearColor::Black;
-    }
-
-    // トーンマッピングを適用
-    CachedAverageColor  = ApplyToneMapping(CachedAverageColor, ResultParams);
-    CachedTopColor      = ApplyToneMapping(CachedTopColor, ResultParams);
-    CachedSideColor     = ApplyToneMapping(CachedSideColor, ResultParams);
-    CachedDominantColor = ApplyToneMapping(CachedDominantColor, ResultParams);
-}
-
-// ============================================================
-// ApplyToneMapping — Reinhard + 彩度ブースト
-// ============================================================
-
-FLinearColor FLightSyncGPUSampler::ApplyToneMapping(
-    const FLinearColor& HDRColor,
-    const FSamplingParams& ToneMappingParams) const
-{
-    FLinearColor Result = HDRColor;
-
-    float Lum = 0.2126f * Result.R + 0.7152f * Result.G + 0.0722f * Result.B;
-
-    if (Lum > KINDA_SMALL_NUMBER)
-    {
-        const float LumExposed = Lum * ToneMappingParams.ToneMappingExposure;
-        const float MappedLum  = LumExposed / (1.0f + LumExposed); // Reinhard
-
-        const float Scale = MappedLum / Lum;
-        Result.R *= Scale;
-        Result.G *= Scale;
-        Result.B *= Scale;
-
-        if (!FMath::IsNearlyEqual(ToneMappingParams.SaturationBoost, 1.0f))
-        {
-            const float NewLum = 0.2126f * Result.R + 0.7152f * Result.G + 0.0722f * Result.B;
-            if (NewLum > KINDA_SMALL_NUMBER)
-            {
-                Result.R = NewLum + (Result.R - NewLum) * ToneMappingParams.SaturationBoost;
-                Result.G = NewLum + (Result.G - NewLum) * ToneMappingParams.SaturationBoost;
-                Result.B = NewLum + (Result.B - NewLum) * ToneMappingParams.SaturationBoost;
-            }
-        }
-    }
-    else
-    {
-        return FLinearColor::Black;
-    }
-
-    Result.R = FMath::Clamp(Result.R, 0.0f, 1.0f);
-    Result.G = FMath::Clamp(Result.G, 0.0f, 1.0f);
-    Result.B = FMath::Clamp(Result.B, 0.0f, 1.0f);
-    Result.A = 1.0f;
-    return Result;
-}
-
-// ============================================================
-// ComputeAverageColor_CPUSync — CPU 同期フォールバック
-// ============================================================
-
-void FLightSyncGPUSampler::ComputeAverageColor_CPUSync(UTextureRenderTargetCube* CubeRT)
-{
+    OutSize = 0;
     if (!CubeRT || !CubeRT->GetResource())
     {
-        return;
+        return false;
     }
 
     FRenderTarget* RenderTarget = CubeRT->GameThread_GetRenderTargetResource();
     if (!RenderTarget)
     {
-        return;
+        return false;
     }
 
     const int32 Size = CubeRT->SizeX;
-
-    // UE5 は Z-up: +Z=天頂, -Z=床
-    const float FaceWeights[6] = {
-        Params.SideFaceWeight,    // +X
-        Params.SideFaceWeight,    // -X
-        Params.SideFaceWeight,    // +Y
-        Params.SideFaceWeight,    // -Y
-        Params.TopFaceWeight,     // +Z (Top)
-        Params.BottomFaceWeight,  // -Z (Bottom)
-    };
-
-    TArray<FLinearColor> FaceColors;
-    TArray<float>        FaceColorWeights;
-    FaceColors.SetNum(6);
-    FaceColorWeights.SetNum(6);
-
-    float         MaxLuminance      = 0.0f;
-    FLinearColor  MaxLuminanceColor = FLinearColor::Black;
-
     for (int32 FaceIndex = 0; FaceIndex < 6; ++FaceIndex)
     {
-        if (FaceWeights[FaceIndex] <= KINDA_SMALL_NUMBER)
-        {
-            FaceColors[FaceIndex]       = FLinearColor::Black;
-            FaceColorWeights[FaceIndex] = 0.0f;
-            continue;
-        }
-
         TArray<FFloat16Color> Pixels;
         FReadSurfaceDataFlags ReadFlags(RCM_MinMax);
         ReadFlags.SetCubeFace(static_cast<ECubeFace>(FaceIndex));
-        bool bSuccess = RenderTarget->ReadFloat16Pixels(Pixels, ReadFlags);
-
-        if (!bSuccess || Pixels.Num() == 0)
+        if (!RenderTarget->ReadFloat16Pixels(Pixels, ReadFlags) || Pixels.Num() < Size * Size)
         {
-            FaceColors[FaceIndex]       = FLinearColor::Black;
-            FaceColorWeights[FaceIndex] = 0.0f;
-            continue;
+            return false;
         }
 
-        double AccumR = 0.0, AccumG = 0.0, AccumB = 0.0;
-        double TotalWeight = 0.0;
-        float  FaceMaxLum  = 0.0f;
-        FLinearColor FaceMaxColor = FLinearColor::Black;
-
-        const int32 Step = FMath::Max(1, Size / FMath::Max(Params.DownsampleResolution, 1));
-        for (int32 Y = 0; Y < Size; Y += Step)
+        OutFaces[FaceIndex].SetNumUninitialized(Size * Size);
+        for (int32 Index = 0; Index < Size * Size; ++Index)
         {
-            for (int32 X = 0; X < Size; X += Step)
-            {
-                const int32 Index = Y * Size + X;
-                if (Index >= Pixels.Num()) continue;
-
-                const FFloat16Color& Pixel = Pixels[Index];
-                float R = FMath::Min(Pixel.R.GetFloat(), Params.HDRClamp);
-                float G = FMath::Min(Pixel.G.GetFloat(), Params.HDRClamp);
-                float B = FMath::Min(Pixel.B.GetFloat(), Params.HDRClamp);
-
-                float Luminance = 0.2126f * R + 0.7152f * G + 0.0722f * B;
-                if (Luminance < Params.DarkThreshold) continue;
-                if (Params.bFilterDirectLight && Luminance > Params.DirectLightThreshold) continue;
-
-                float Weight = FMath::Pow(Luminance, Params.LuminanceExponent);
-                AccumR      += R * Weight;
-                AccumG      += G * Weight;
-                AccumB      += B * Weight;
-                TotalWeight += Weight;
-
-                if (Luminance > FaceMaxLum)
-                {
-                    FaceMaxLum   = Luminance;
-                    FaceMaxColor = FLinearColor(R, G, B, 1.0f);
-                }
-            }
-        }
-
-        if (TotalWeight > KINDA_SMALL_NUMBER)
-        {
-            FaceColors[FaceIndex] = FLinearColor(
-                static_cast<float>(AccumR / TotalWeight),
-                static_cast<float>(AccumG / TotalWeight),
-                static_cast<float>(AccumB / TotalWeight), 1.0f);
-            FaceColorWeights[FaceIndex] = static_cast<float>(TotalWeight);
-        }
-        else
-        {
-            FaceColors[FaceIndex]       = FLinearColor::Black;
-            FaceColorWeights[FaceIndex] = 0.0f;
-        }
-
-        if (FaceMaxLum > MaxLuminance)
-        {
-            MaxLuminance      = FaceMaxLum;
-            MaxLuminanceColor = FaceMaxColor;
+            OutFaces[FaceIndex][Index] = FLinearColor(Pixels[Index].R.GetFloat(), Pixels[Index].G.GetFloat(),
+                                                      Pixels[Index].B.GetFloat(), 1.0f);
         }
     }
 
-    // --- 全体平均 (設定ウェイトのみで面間加重) ---
-    FLinearColor TotalColor = FLinearColor::Black;
-    float        TotalW     = 0.0f;
-    for (int32 i = 0; i < 6; ++i)
+    OutSize = Size;
+    return true;
+}
+
+void FLightSyncGPUSampler::ComputeCPU(UTextureRenderTargetCube* CubeRT)
+{
+    TArray<FLinearColor> Faces[6];
+    int32 Size = 0;
+    if (!ReadCubeTexels(CubeRT, Faces, Size))
     {
-        if (FaceWeights[i] > KINDA_SMALL_NUMBER && FaceColorWeights[i] > KINDA_SMALL_NUMBER)
-        {
-            TotalColor.R += FaceColors[i].R * FaceWeights[i];
-            TotalColor.G += FaceColors[i].G * FaceWeights[i];
-            TotalColor.B += FaceColors[i].B * FaceWeights[i];
-            TotalW       += FaceWeights[i];
-        }
+        return;
     }
-    CachedAverageColor = (TotalW > KINDA_SMALL_NUMBER)
-        ? FLinearColor(TotalColor.R / TotalW, TotalColor.G / TotalW, TotalColor.B / TotalW, 1.0f)
-        : FLinearColor::Black;
 
-    // Top (+Z = 面 4, UE5 の天頂方向)
-    CachedTopColor = FaceColors[4];
-
-    // Side (faces 0,1,2,3: ±X, ±Y)
-    FLinearColor SideAcc  = FLinearColor::Black;
-    float        SideW    = 0.0f;
-    constexpr int32 SideIdx[] = {0, 1, 2, 3};
-    for (int32 Idx : SideIdx)
-    {
-        if (FaceColorWeights[Idx] > KINDA_SMALL_NUMBER)
-        {
-            SideAcc.R += FaceColors[Idx].R * FaceWeights[Idx];
-            SideAcc.G += FaceColors[Idx].G * FaceWeights[Idx];
-            SideAcc.B += FaceColors[Idx].B * FaceWeights[Idx];
-            SideW     += FaceWeights[Idx];
-        }
-    }
-    CachedSideColor = (SideW > KINDA_SMALL_NUMBER)
-        ? FLinearColor(SideAcc.R / SideW, SideAcc.G / SideW, SideAcc.B / SideW, 1.0f)
-        : FLinearColor::Black;
-
-    CachedDominantColor = MaxLuminanceColor;
-
-    CachedAverageColor  = ApplyToneMapping(CachedAverageColor, Params);
-    CachedTopColor      = ApplyToneMapping(CachedTopColor, Params);
-    CachedSideColor     = ApplyToneMapping(CachedSideColor, Params);
-    CachedDominantColor = ApplyToneMapping(CachedDominantColor, Params);
-
-    bResultReady = true;
+    CPUResult = LightSyncZones::IntegrateCube(Faces, Size, Setup);
+    bCPUResultPending = true;
 }

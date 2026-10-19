@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "LightSyncZones.h"
 #include "OSCColorOutputComponent.generated.h"
 
 class UOSCClient;
@@ -46,6 +47,10 @@ struct LIGHTSYNCDMX_API FOSCTargetConfig
     /** ターゲット名 (識別用) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC")
     FString TargetName = TEXT("QLC+ PC");
+
+    /** 送信するゾーン (プローブの Color Sampler → Zones の Name) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC")
+    FName Zone = TEXT("Average");
 
     /** 送信先IPアドレス */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC")
@@ -145,6 +150,10 @@ public:
     /** 色をOSCで送信 (全ターゲットに送信) */
     UFUNCTION(BlueprintCallable, Category = "OSC")
     void SendColor(const FLinearColor &Color);
+
+    /** 各ターゲットに、指定したゾーンの色を送信 */
+    UFUNCTION(BlueprintCallable, Category = "OSC")
+    void SendZoneColors(const TArray<FLightSyncZoneResult> &ZoneResults);
 
     /** 特定のターゲットにのみ色を送信 */
     UFUNCTION(BlueprintCallable, Category = "OSC")

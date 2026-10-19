@@ -121,6 +121,46 @@ void UOSCColorOutputComponent::SendColor(const FLinearColor &Color)
     SentMessageCount++;
 }
 
+void UOSCColorOutputComponent::SendZoneColors(const TArray<FLightSyncZoneResult> &ZoneResults)
+{
+    if (!bOSCOutputEnabled || ZoneResults.Num() == 0)
+    {
+        return;
+    }
+
+    EnsureClientsInitialized();
+
+    const double NowSeconds = FPlatformTime::Seconds();
+    const double MinInterval = 1.0 / FMath::Max(static_cast<double>(OSCSendRate), 1.0);
+    if (LastOSCSendTimeSeconds >= 0.0 && (NowSeconds - LastOSCSendTimeSeconds) < MinInterval)
+    {
+        return;
+    }
+    LastOSCSendTimeSeconds = NowSeconds;
+
+    for (int32 i = 0; i < Targets.Num(); ++i)
+    {
+        if (!Targets[i].bEnabled)
+        {
+            continue;
+        }
+
+        const FLightSyncZoneResult *Found = ZoneResults.FindByPredicate(
+            [this, i](const FLightSyncZoneResult &Result) { return Result.Name == Targets[i].Zone; });
+        if (!Found)
+        {
+            continue;
+        }
+
+        FLinearColor DimmedColor = Found->Color * FMath::Clamp(MasterDimmer, 0.0f, 1.0f);
+        DimmedColor.A = 1.0f;
+        LastSentColor = DimmedColor;
+        SendToTarget(i, DimmedColor);
+    }
+
+    SentMessageCount++;
+}
+
 void UOSCColorOutputComponent::SendColorToTarget(const FLinearColor &Color, int32 TargetIndex)
 {
     if (!bOSCOutputEnabled || !Targets.IsValidIndex(TargetIndex))

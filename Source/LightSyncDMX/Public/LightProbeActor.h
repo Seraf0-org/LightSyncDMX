@@ -4,6 +4,8 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "Engine/Scene.h"
+#include "LightColorSamplerComponent.h"
 #include "LightProbeActor.generated.h"
 
 class ULightColorSamplerComponent;
@@ -14,29 +16,30 @@ class UTextureRenderTargetCube;
 class UStaticMeshComponent;
 class UBillboardComponent;
 
-/** 出力で使用する色の方向ソース */
+/** 照明の色を何に合わせるか */
 UENUM(BlueprintType)
-enum class ELightProbeColorSource : uint8
+enum class ELightSyncReferenceMode : uint8
 {
-    /** 全体平均 (デフォルト) */
-    Average UMETA(DisplayName = "Average (All Directions)"),
-    
-    /** 上方向のみ (天井ライト用) */
-    Top UMETA(DisplayName = "Top (Ceiling Lights)"),
-    
-    /** 横方向のみ (側面ライト用) */
-    Side UMETA(DisplayName = "Side (Wall Lights)"),
-    
-    /** 最も明るい光源 (スポットライト用) */
-    Dominant UMETA(DisplayName = "Dominant (Brightest)")
+    /**
+     * LEDウォールの表示色に合わせる (ディスプレイ基準)。
+     * 参照カメラと同じ露出・グレーディング・トーンカーブを通した後のリニア値で積分する。
+     * 壁と照明がカメラ上で揃う。
+     */
+    Wall UMETA(DisplayName = "LED Wall (Display-Referred)"),
+
+    /**
+     * シーンの物理的な光に合わせる (シーン基準)。
+     * トーンマップ前の放射輝度を、参照カメラ (または手動) の露出だけで正規化する。
+     */
+    Scene UMETA(DisplayName = "Scene Light (Scene-Referred)"),
 };
 
 /**
  * ALightProbeActor
  *
  * シーンに配置する光サンプリングプローブ。
- * 配置位置の周囲360°の光を SceneCaptureComponentCube でキャプチャし、
- * 平均色を算出してDMX信号として出力する。
+ * 配置位置の周囲360°を SceneCaptureComponentCube でキャプチャし、
+ * ゾーンごとの正規化照度 (ULightColorSamplerComponent) を DMX / OSC に出力する。
  *
  * VP(バーチャルプロダクション)でLEDウォール/照明の色味を
  * UEのシーンと一致させるために使用する。
@@ -107,63 +110,45 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
     FString ProbeName = TEXT("LightProbe_01");
 
-    // === 出力色ソース ===
+    // === 色の基準 ===
 
-    /** DMX出力に使用する色のソース */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Output")
-    ELightProbeColorSource DMXColorSource = ELightProbeColorSource::Average;
+    /** 照明の色を何に合わせるか */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference")
+    ELightSyncReferenceMode ReferenceMode = ELightSyncReferenceMode::Wall;
 
-    /** OSC出力に使用する色のソース */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Output")
-    ELightProbeColorSource OSCColorSource = ELightProbeColorSource::Average;
+    /**
+     * 参照カメラ (CameraComponent を持つアクター。ICVFX カメラや CineCameraActor)。
+     * Wall: このカメラのポストプロセス (露出・グレーディング・トーンカーブ) をキャプチャに使う。
+     * Scene: このカメラの手動露出で正規化する。
+     * 未設定なら下の手動露出を使う。
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference")
+    TObjectPtr<AActor> ReferenceCamera;
 
-    // === 色補正 ===
+    /** 参照カメラが無いときの露出 (EV100)。UE の Manual 露出と同じ定義 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference", meta = (ClampMin = "-10", ClampMax = "20"))
+    float ManualEV100 = 0.0f;
 
-    /** ガンマ補正値 (1.0=リニア出力, 2.2=sRGB変換) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Color", meta = (ClampMin = "0.1", ClampMax = "5.0"))
-    float GammaCorrection = 1.0f;
+    /** 参照カメラが無いときの露出補正 (stop)。UE の Exposure Compensation と同じ定義 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference", meta = (ClampMin = "-15", ClampMax = "15"))
+    float ManualExposureBias = 1.0f;
 
-    /** 色温度オフセット (K) - リアルLEDとの色味調整用 */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Color", meta = (ClampMin = "-3000", ClampMax = "3000"))
-    float ColorTemperatureOffset = 0.0f;
+    /**
+     * Wall モード: LEDウォールの表示特性 (信号値 → 光)。
+     * nDisplay は sRGB でエンコードした信号を送るので、壁が sRGB/ガンマで光に戻す特性を選ぶ。
+     * 実測で合わせる場合はキャリブレーションの壁パッチ測定で補正される。
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference",
+              meta = (EditCondition = "ReferenceMode == ELightSyncReferenceMode::Wall"))
+    ELightSyncInputTransfer WallDisplayEOTF = ELightSyncInputTransfer::SRGB;
 
-    /** 彩度の乗数 */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Color", meta = (ClampMin = "0.0", ClampMax = "3.0"))
-    float SaturationMultiplier = 1.0f;
+    /** 全ゾーン共通の出力ゲイン (リニア)。灯体ごとの強さはフィクスチャ側で調整する */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+    float OutputGain = 1.0f;
 
-    /** 明度の乗数 */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Color", meta = (ClampMin = "0.0", ClampMax = "3.0"))
-    float BrightnessMultiplier = 1.0f;
-
-    /** 色のみモード: 明度を正規化して色相・彩度だけを送信 (明度は照明側で制御) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Color")
-    bool bColorOnly = false;
-
-    /** 色のみモード時の最低明度 (暗いシーンで完全なブラックを送る閾値) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Color", meta = (ClampMin = "0.0", ClampMax = "0.1", EditCondition = "bColorOnly"))
-    float ColorOnlyBlackThreshold = 0.01f;
-
-    // === 出力 (読み取り専用) ===
-
-    /** 現在のサンプリング結果色 (全体平均) */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output|Colors")
-    FLinearColor CurrentSampledColor;
-
-    /** 上方向の色 */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output|Colors")
-    FLinearColor CurrentTopColor;
-
-    /** 横方向の色 */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output|Colors")
-    FLinearColor CurrentSideColor;
-
-    /** 最も明るい光源の色 */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output|Colors")
-    FLinearColor CurrentDominantColor;
-
-    /** DMX送信用に補正された色 */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LightProbe|Output")
-    FLinearColor CorrectedOutputColor;
+    /** 直近のキャプチャで使った露出倍率 (Scene モード) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Reference")
+    float EffectiveExposureScale = 1.0f;
 
     // === メソッド ===
 
@@ -175,25 +160,13 @@ public:
     UFUNCTION(BlueprintCallable, Category = "LightProbe")
     void ForceSampleOnce();
 
-    /** 現在のサンプリング色を取得 (全体平均) */
+    /** 名前でゾーンの色を取得 (リニア、正規化照度) */
     UFUNCTION(BlueprintPure, Category = "LightProbe")
-    FLinearColor GetCurrentColor() const { return CorrectedOutputColor; }
+    bool GetZoneColor(FName ZoneName, FLinearColor &OutColor) const;
 
-    /** 上方向の色を取得 */
+    /** 先頭の有効ゾーンの色 (一覧表示用) */
     UFUNCTION(BlueprintPure, Category = "LightProbe")
-    FLinearColor GetTopColor() const { return CurrentTopColor; }
-
-    /** 横方向の色を取得 */
-    UFUNCTION(BlueprintPure, Category = "LightProbe")
-    FLinearColor GetSideColor() const { return CurrentSideColor; }
-
-    /** 最も明るい光源の色を取得 */
-    UFUNCTION(BlueprintPure, Category = "LightProbe")
-    FLinearColor GetDominantColor() const { return CurrentDominantColor; }
-
-    /** 指定したソースの色を取得 */
-    UFUNCTION(BlueprintPure, Category = "LightProbe")
-    FLinearColor GetColorBySource(ELightProbeColorSource Source) const;
+    FLinearColor GetCurrentColor() const;
 
     /** プローブ名を取得 */
     UFUNCTION(BlueprintPure, Category = "LightProbe")
@@ -242,12 +215,12 @@ private:
     /** サブシステムのデバッグ描画 */
     void DrawDebugProbe() const;
 
-    /** 色補正を適用 */
-    FLinearColor ApplyColorCorrection(const FLinearColor &RawColor) const;
+    /** 基準モードに合わせて CaptureSource / ShowFlags / PostProcess を設定し、サンプラーへの文脈を返す */
+    FLightSyncSampleContext ApplyCaptureSettings();
 
-    /** 色のみモードを適用 */
-    FLinearColor ApplyColorOnlyMode(const FLinearColor &InputColor) const;
+    /** 参照カメラの最終ポストプロセス設定を取得 */
+    bool GetReferenceCameraPostProcess(FPostProcessSettings &OutSettings) const;
 
-    /** 色温度をRGB変換 */
-    static FLinearColor ColorTemperatureToRGB(float TempKelvin);
+    /** 自動露出の警告を一度だけ出すためのフラグ */
+    bool bWarnedAutoExposure = false;
 };

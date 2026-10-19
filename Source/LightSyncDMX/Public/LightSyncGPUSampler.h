@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "LightSyncZones.h"
 
 class UTextureRenderTargetCube;
 class FRHIGPUBufferReadback; // RHIGPUReadback.h をインクルードするのは .cpp 側
@@ -10,15 +11,13 @@ class FRHIGPUBufferReadback; // RHIGPUReadback.h をインクルードするの�
 /**
  * FLightSyncGPUSampler
  *
- * CubeMap から輝度加重平均色を計算するサンプラー。
+ * キューブマップをゾーンごとに立体角で積分するサンプラー (LightSyncAverageCS.usf)。
  *
- * GPU Compute Shader (SM5+) を使用して非同期にサンプリングし、
- * 1〜2 フレーム後にゲームスレッドで結果を取得できる。
- * GPU 使用不可時は CPU 同期方式にフォールバックする。
+ * GPU Compute Shader (SM5+) で非同期に積分し、1〜2 フレーム後にゲームスレッドで結果を取得する。
+ * GPU が使えない場合や CPU 指定時は、同じ式の CPU 版 (LightSyncZones::IntegrateCube) で同期計算する。
  *
  * 使い方:
- *   毎フレーム DispatchSampling() を呼んでディスパッチし、
- *   その直後に TryGetResult() で前フレーム以前の結果を取得する。
+ *   SetSetup() でゾーンを設定 → 毎サンプル DispatchSampling() → TryGetNewResult() で最新結果を取得。
  */
 class LIGHTSYNCDMX_API FLightSyncGPUSampler
 {
@@ -29,55 +28,40 @@ public:
     void Initialize();
     void Release();
 
-    /** CubeMap のサンプリングを GPU (or CPU) にディスパッチ */
-    void DispatchSampling(UTextureRenderTargetCube* CubeRT);
-
-    /**
-     * サンプリング結果を取得する。
-     * GPU 結果が準備できていれば true を返し、まだ未準備でも
-     * キャッシュ済みの前フレーム結果があれば true を返す。
-     */
-    bool TryGetResult(FLinearColor& OutAverageColor,
-                      FLinearColor& OutTopColor,
-                      FLinearColor& OutSideColor,
-                      FLinearColor& OutDominantColor);
-
-    /** サンプリングパラメータ */
-    struct FSamplingParams
-    {
-        float LuminanceExponent    = 0.5f;
-        float DarkThreshold        = 0.001f;
-        float HDRClamp             = 10.0f;
-        float DirectLightThreshold = 1.5f;
-        bool  bFilterDirectLight   = true;
-        float TopFaceWeight        = 0.3f;
-        float BottomFaceWeight     = 0.1f;
-        float SideFaceWeight       = 1.0f;
-        float ToneMappingExposure  = 0.5f;
-        float SaturationBoost      = 2.0f;
-        int32 DownsampleResolution = 8;
-    };
-
-    void SetParams(const FSamplingParams& InParams) { Params = InParams; }
+    void SetSetup(const LightSyncZones::FSetup& InSetup) { Setup = InSetup; }
     void SetForceCPUSync(bool bInForceCPUSync);
     bool IsInitialized() const { return bInitialized; }
 
-private:
-    FSamplingParams Params;
+    /** キューブマップの積分を GPU (or CPU) にディスパッチ */
+    void DispatchSampling(UTextureRenderTargetCube* CubeRT);
 
-    // キャッシュ済み結果
-    FLinearColor CachedAverageColor  = FLinearColor::Black;
-    FLinearColor CachedTopColor      = FLinearColor::Black;
-    FLinearColor CachedSideColor     = FLinearColor::Black;
-    FLinearColor CachedDominantColor = FLinearColor::Black;
+    /**
+     * 新しい結果があれば OutResult に入れて true を返す。
+     * OutResult.Zones の数はディスパッチ時点のゾーン数 (設定変更直後は現在の設定と違うことがある)。
+     */
+    bool TryGetNewResult(LightSyncZones::FResult& OutResult);
+
+    /** CPU でキューブマップを読み出す (検証用。ゲームスレッドで同期読み出しするので重い) */
+    static bool ReadCubeTexels(UTextureRenderTargetCube* CubeRT, TArray<FLinearColor> (&OutFaces)[6], int32& OutSize);
+
+    /** GPU の出力バッファのレイアウト: ピーク 6 + 重心 6 + 面 6 × MaxZones */
+    static constexpr int32 RefineBase = 6;
+    static constexpr int32 ZonesBase = 12;
+    static constexpr int32 NumOutputElements = ZonesBase + 6 * LightSyncZones::MaxZones;
+
+private:
+    LightSyncZones::FSetup Setup;
 
     bool bInitialized      = false;
     bool bDispatched       = false; // GPU ディスパッチが進行中 (ゲームスレッドのみ書き込み)
-    bool bResultReady      = false; // キャッシュに有効な結果がある
     bool bGPUPathAvailable = false;
     bool bForceCPUSync     = false;
 
-    // GPU Async Readback バッファ (12 × FVector4f)
+    // CPU 経路の結果 (DispatchSampling で同期計算)
+    bool bCPUResultPending = false;
+    LightSyncZones::FResult CPUResult;
+
+    // GPU Async Readback バッファ
     TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackBuffer;
 
     // レンダースレッド → ゲームスレッド結果転送用。
@@ -85,22 +69,15 @@ private:
     struct FReadbackSharedState
     {
         mutable FCriticalSection Lock;
-        FVector4f RawData[12];
-        FSamplingParams RawParams;
+        FVector4f RawData[NumOutputElements];
+        int32 NumZones = 0;
         bool bDataReady = false;
     };
 
     TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> ReadbackState;
-    FSamplingParams InFlightParams;
+    int32 InFlightNumZones = 0;
 
-    // GPU Readback データを処理して Cached* に書き込む
-    void ProcessReadbackData(const FVector4f* Data, const FSamplingParams& ResultParams);
-
-    // トーンマッピング (Reinhard + 彩度ブースト)
-    FLinearColor ApplyToneMapping(const FLinearColor& HDRColor, const FSamplingParams& ToneMappingParams) const;
-
-    // CPU 同期フォールバック
-    void ComputeAverageColor_CPUSync(UTextureRenderTargetCube* CubeRT);
+    void ComputeCPU(UTextureRenderTargetCube* CubeRT);
 
     bool ShouldUseCPUPath() const { return bForceCPUSync || !bGPUPathAvailable; }
 };

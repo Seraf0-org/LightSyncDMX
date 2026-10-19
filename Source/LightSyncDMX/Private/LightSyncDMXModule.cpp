@@ -5,10 +5,47 @@
 #include "Interfaces/IPluginManager.h"
 #include "Misc/Paths.h"
 #include "ShaderCore.h"
+#include "HAL/IConsoleManager.h"
+#include "UObject/UObjectIterator.h"
+#include "LightColorSamplerComponent.h"
+#include "GameFramework/Actor.h"
 
 #define LOCTEXT_NAMESPACE "FLightSyncDMXModule"
 
 DEFINE_LOG_CATEGORY(LogLightSyncDMX);
+
+// 検証用: 全プローブで GPU 積分結果と CPU 版 (同じ式) を比べる
+static FAutoConsoleCommand GLightSyncValidateGPUCommand(
+    TEXT("LightSync.ValidateGPU"),
+    TEXT("全 LightProbe の GPU ゾーン積分を CPU 版と比較してログに出す (静止シーンで使用)"),
+    FConsoleCommandDelegate::CreateLambda([]()
+    {
+        float WorstError = 0.0f;
+        int32 Compared = 0;
+        for (TObjectIterator<ULightColorSamplerComponent> It; It; ++It)
+        {
+            const ULightColorSamplerComponent *Sampler = *It;
+            if (!IsValid(Sampler) || Sampler->IsTemplate() || !Sampler->GetOwner())
+            {
+                continue;
+            }
+
+            FString Report;
+            float MaxError = 0.0f;
+            if (Sampler->ValidateAgainstCPU(Report, MaxError))
+            {
+                ++Compared;
+                WorstError = FMath::Max(WorstError, MaxError);
+                UE_LOG(LogLightSyncDMX, Display, TEXT("ValidateGPU '%s': max error %.4f%%\n%s"),
+                       *Sampler->GetOwner()->GetName(), MaxError * 100.0f, *Report);
+            }
+            else
+            {
+                UE_LOG(LogLightSyncDMX, Display, TEXT("ValidateGPU '%s': %s"), *Sampler->GetOwner()->GetName(), *Report);
+            }
+        }
+        UE_LOG(LogLightSyncDMX, Display, TEXT("LIGHTSYNC_VALIDATE compared=%d maxerr=%.6f"), Compared, WorstError);
+    }));
 
 void FLightSyncDMXModule::StartupModule()
 {
