@@ -13,6 +13,7 @@
 #include "UObject/ConstructorHelpers.h"
 #include "Camera/CameraComponent.h"
 #include "HAL/IConsoleManager.h"
+#include "LightSyncNDisplay.h"
 #include "LightSyncSubsystem.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
@@ -365,6 +366,54 @@ namespace
     }
 }
 
+FPostProcessSettings ALightProbeActor::BuildReferencePostProcess()
+{
+    FPostProcessSettings CameraPP;
+    const bool bHasCamera = GetReferenceCameraPostProcess(CameraPP);
+
+    if (bHasCamera && CameraPP.AutoExposureMethod != EAutoExposureMethod::AEM_Manual && !bWarnedAutoExposure)
+    {
+        UE_LOG(LogLightSyncDMX, Warning,
+               TEXT("LightProbe '%s': 参照カメラの露出が Manual ではありません。プローブは Manual として計算します (ICVFX では Manual 露出を推奨)。"),
+               *ProbeName);
+        bWarnedAutoExposure = true;
+    }
+
+    // シーン側: 参照カメラ、なければ手動露出を物理カメラ (ISO 100 / 1 秒 / F=√2^EV) で表す。
+    // nDisplay の露出補正が Bias だけを置き換えても EV100 が残るように、Bias に畳み込まない
+    FPostProcessSettings ScenePP = CameraPP;
+    if (!bHasCamera)
+    {
+        ScenePP = FPostProcessSettings();
+        ScenePP.bOverride_AutoExposureMethod = true;
+        ScenePP.AutoExposureMethod = EAutoExposureMethod::AEM_Manual;
+        ScenePP.bOverride_AutoExposureApplyPhysicalCameraExposure = true;
+        ScenePP.AutoExposureApplyPhysicalCameraExposure = true;
+        ScenePP.bOverride_CameraISO = true;
+        ScenePP.CameraISO = 100.0f;
+        ScenePP.bOverride_CameraShutterSpeed = true;
+        ScenePP.CameraShutterSpeed = 1.0f;
+        ScenePP.bOverride_DepthOfFieldFstop = true;
+        ScenePP.DepthOfFieldFstop = FMath::Sqrt(FMath::Pow(2.0f, ManualEV100));
+        ScenePP.bOverride_AutoExposureBias = true;
+        ScenePP.AutoExposureBias = ManualExposureBias;
+    }
+
+    if (PostProcessSource != ELightSyncPostProcessSource::NDisplay)
+    {
+        NDisplayReport.Reset();
+        return ScenePP;
+    }
+
+    AActor *Root = NDisplayRootActor ? NDisplayRootActor.Get() : LightSyncNDisplay::FindRootActor(GetWorld());
+    FPostProcessSettings Result;
+    if (!LightSyncNDisplay::BuildOuterViewportPostProcess(Root, NDisplayViewportId, ScenePP, Result, NDisplayReport))
+    {
+        return ScenePP;
+    }
+    return Result;
+}
+
 FLightSyncSampleContext ALightProbeActor::ApplyCaptureSettings()
 {
     FLightSyncSampleContext Context;
@@ -392,19 +441,9 @@ FLightSyncSampleContext ALightProbeActor::ApplyCaptureSettings()
     Flags.SetVolumetricFog(true);
     Flags.SetAmbientOcclusion(true);
 
-    FPostProcessSettings CameraPP;
-    const bool bHasCamera = GetReferenceCameraPostProcess(CameraPP);
-
-    if (bHasCamera && CameraPP.AutoExposureMethod != EAutoExposureMethod::AEM_Manual && !bWarnedAutoExposure)
-    {
-        UE_LOG(LogLightSyncDMX, Warning,
-               TEXT("LightProbe '%s': 参照カメラの露出が Manual ではありません。プローブは Manual として計算します (ICVFX では Manual 露出を推奨)。"),
-               *ProbeName);
-        bWarnedAutoExposure = true;
-    }
-
-    const float EV100 = bHasCamera ? PhysicalCameraEV100(CameraPP) : ManualEV100;
-    const float Bias = bHasCamera ? CameraPP.AutoExposureBias : ManualExposureBias;
+    const FPostProcessSettings ReferencePP = BuildReferencePostProcess();
+    const float EV100 = PhysicalCameraEV100(ReferencePP);
+    const float Bias = ReferencePP.AutoExposureBias;
     EffectiveExposureScale = ComputeManualExposureScale(EV100, Bias);
 
     if (ReferenceMode == ELightSyncReferenceMode::Wall)
@@ -418,7 +457,7 @@ FLightSyncSampleContext ALightProbeActor::ApplyCaptureSettings()
         Flags.SetColorGrading(true);
         Flags.SetEyeAdaptation(true);
 
-        FPostProcessSettings PP = bHasCamera ? CameraPP : FPostProcessSettings();
+        FPostProcessSettings PP = ReferencePP;
 
         // 露出は必ず手動に固定 (キューブキャプチャが自分の中身に自動露出しないように)。
         // 物理カメラ分は Bias に畳み込む: 0.18 * 2^(Bias - EV100) と同じ倍率になる

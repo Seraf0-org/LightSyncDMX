@@ -34,6 +34,20 @@ enum class ELightSyncReferenceMode : uint8
     Scene UMETA(DisplayName = "Scene Light (Scene-Referred)"),
 };
 
+/** ポストプロセス (露出・グレーディング・トーンカーブ) をどこから取るか */
+UENUM(BlueprintType)
+enum class ELightSyncPostProcessSource : uint8
+{
+    /** 参照カメラ (未設定なら手動露出) */
+    ReferenceCamera UMETA(DisplayName = "Reference Camera / Manual"),
+
+    /**
+     * nDisplay の外側ビューポート (壁に出る環境) と同じ合成。
+     * 参照カメラ (or 手動露出) をシーンとして、RootActor のカスタム PP とカラーグレーディングを重ねる。
+     */
+    NDisplay UMETA(DisplayName = "nDisplay Outer Viewport"),
+};
+
 /**
  * ALightProbeActor
  *
@@ -128,6 +142,27 @@ public:
      */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference")
     TObjectPtr<AActor> ReferenceCamera;
+
+    /** ポストプロセスの取得元 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference")
+    ELightSyncPostProcessSource PostProcessSource = ELightSyncPostProcessSource::ReferenceCamera;
+
+    /** nDisplay の RootActor (未設定ならレベル内の最初の RootActor) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference",
+              meta = (EditCondition = "PostProcessSource == ELightSyncPostProcessSource::NDisplay"))
+    TObjectPtr<AActor> NDisplayRootActor;
+
+    /**
+     * Per-Viewport グレーディングとカスタム PP を引くビューポート ID (例: VP_0)。
+     * プローブが照らしたい方向の壁を映しているビューポートを指定する。空ならクラスタ全体のグレーディングのみ。
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference",
+              meta = (EditCondition = "PostProcessSource == ELightSyncPostProcessSource::NDisplay"))
+    FString NDisplayViewportId;
+
+    /** 直近に適用した nDisplay のレイヤー (診断用) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Reference")
+    FString NDisplayReport;
 
     /** 参照カメラが無いときの露出 (EV100)。UE の Manual 露出と同じ定義 */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference", meta = (ClampMin = "-10", ClampMax = "20"))
@@ -224,6 +259,9 @@ private:
 
     /** 参照カメラの最終ポストプロセス設定を取得 */
     bool GetReferenceCameraPostProcess(FPostProcessSettings &OutSettings) const;
+
+    /** 基準のポストプロセス (参照カメラ or 手動露出、nDisplay 選択時はレイヤーを重ねたもの) */
+    FPostProcessSettings BuildReferencePostProcess();
 
     /** 自動露出の警告を一度だけ出すためのフラグ */
     bool bWarnedAutoExposure = false;

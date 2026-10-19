@@ -6,6 +6,7 @@
 #include "DMXColorOutputComponent.h"
 #include "OSCColorOutputComponent.h"
 #include "LightSyncCalibrator.h"
+#include "LightSyncNDisplay.h"
 #include "PropertyCustomizationHelpers.h"
 #include "AssetRegistry/AssetData.h"
 #include "Engine/Texture.h"
@@ -573,6 +574,50 @@ void SLightSyncMonitorWidget::BuildReferenceSection(ALightProbeActor* Probe)
                 if (W.IsValid() && W->ReferenceCamera)
                     return FText::FromString(W->ReferenceCamera->GetActorNameOrLabel());
                 return LOCTEXT("NoRefCamera", "なし (手動露出を使用。Details パネルで設定)");
+            }));
+
+    static const TCHAR* PostProcessSourceNames[] = {
+        TEXT("参照カメラ / 手動露出"),
+        TEXT("nDisplay 外側ビューポート"),
+    };
+    AddLabeledRow(LOCTEXT("PPSource", "ポストプロセスの取得元"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(0.3f)
+            [SNew(SSpinBox<int32>)
+                .MinValue(0).MaxValue(1).Delta(1)
+                .Value_Lambda([W]() { return W.IsValid() ? static_cast<int32>(W->PostProcessSource) : 0; })
+                .OnValueChanged_Lambda([W](int32 V) {
+                    MarkProbeDirty(W);
+                    if (W.IsValid()) W->PostProcessSource = static_cast<ELightSyncPostProcessSource>(FMath::Clamp(V, 0, 1));
+                })]
+        + SHorizontalBox::Slot().FillWidth(0.7f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
+            [SNew(STextBlock)
+                .Text_Lambda([W]() -> FText {
+                    const int32 Idx = W.IsValid() ? FMath::Clamp(static_cast<int32>(W->PostProcessSource), 0, 1) : 0;
+                    return FText::FromString(PostProcessSourceNames[Idx]);
+                })]);
+
+    AddLabeledRow(LOCTEXT("NDisplayViewport", "nDisplay ビューポート ID"),
+        SNew(SEditableTextBox)
+            .HintText_Lambda([W]() -> FText {
+                if (!W.IsValid()) return FText::GetEmpty();
+                AActor* Root = W->NDisplayRootActor ? W->NDisplayRootActor.Get() : LightSyncNDisplay::FindRootActor(W->GetWorld());
+                const TArray<FString> Ids = LightSyncNDisplay::GetViewportIds(Root);
+                return Ids.Num() > 0 ? FText::FromString(TEXT("例: ") + FString::Join(Ids, TEXT(", ")))
+                                     : LOCTEXT("NoNDisplayRoot", "(nDisplay の RootActor がありません)");
+            })
+            .Text_Lambda([W]() { return W.IsValid() ? FText::FromString(W->NDisplayViewportId) : FText::GetEmpty(); })
+            .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+                MarkProbeDirty(W);
+                if (W.IsValid()) W->NDisplayViewportId = T.ToString();
+            }));
+
+    AddLabeledRow(LOCTEXT("NDisplayLayers", "適用中の nDisplay レイヤー"),
+        SNew(STextBlock)
+            .AutoWrapText(true)
+            .Text_Lambda([W]() -> FText {
+                if (!W.IsValid() || W->PostProcessSource != ELightSyncPostProcessSource::NDisplay) return LOCTEXT("NDisplayOff", "-");
+                return W->NDisplayReport.IsEmpty() ? LOCTEXT("NDisplayNone", "(なし)") : FText::FromString(W->NDisplayReport.TrimEnd());
             }));
 
     AddLabeledRow(LOCTEXT("ManualEV", "手動露出 EV100"),
