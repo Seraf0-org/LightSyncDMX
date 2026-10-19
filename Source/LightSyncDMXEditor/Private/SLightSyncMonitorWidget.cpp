@@ -749,7 +749,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                 {
                     const FDMXFixtureMapping& M = W->DMXOutput->FixtureMappings[0];
-                    const int32 EndCh = M.StartChannel + UDMXColorOutputComponent::GetChannelCount(M.ColorMode) - 1;
+                    const int32 EndCh = M.StartChannel + UDMXColorOutputComponent::GetMappingChannelCount(M) - 1;
                     return FText::FromString(UDMXColorOutputComponent::IsMappingInRange(M)
                         ? FString::Printf(TEXT("Ch %d - %d"), M.StartChannel, EndCh)
                         : FString::Printf(TEXT("Ch %d - %d (512超え: 送信されません)"), M.StartChannel, EndCh));
@@ -766,9 +766,9 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
             }));
 
     // 明度スケール
-    AddLabeledRow(LOCTEXT("BrightScale", "明度スケール"),
+    AddLabeledRow(LOCTEXT("BrightScale", "強さのゲイン"),
         SNew(SSpinBox<float>)
-            .MinValue(0.0f).MaxValue(2.0f).Delta(0.05f)
+            .MinValue(0.0f).MaxValue(100.0f).Delta(0.05f)
             .Value_Lambda([W]() -> float {
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     return W->DMXOutput->FixtureMappings[0].BrightnessScale;
@@ -780,64 +780,43 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                     W->DMXOutput->FixtureMappings[0].BrightnessScale = V;
             }));
 
-    // 10ch専用: Ch2 Green/Magenta
-    AddLabeledRow(LOCTEXT("DMX10ChGreenMagenta", "10ch Ch2 Green/Magenta"),
-        SNew(SSpinBox<int32>)
-            .MinValue(0).MaxValue(255).Delta(1)
-            .Value_Lambda([W]() -> int32 {
+    // プロファイル
+    AddLabeledRow(LOCTEXT("DMXProfile", "灯体プロファイル"),
+        SNew(STextBlock)
+            .Text_Lambda([W]() -> FText {
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return W->DMXOutput->FixtureMappings[0].CCTRGBW10_GreenMagenta;
-                return 0;
-            })
-            .OnValueChanged_Lambda([W](int32 V) {
-                MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].CCTRGBW10_GreenMagenta = V;
+                {
+                    const FDMXFixtureMapping& M = W->DMXOutput->FixtureMappings[0];
+                    if (M.Profile)
+                        return FText::FromString(M.Profile->GetName());
+                    return FText::FromString(FString::Printf(TEXT("内蔵プリセット (未キャリブレーション): %s"),
+                        *StaticEnum<ELightSyncColorMode>()->GetDisplayNameTextByValue(static_cast<int64>(M.ColorMode)).ToString()));
+                }
+                return FText::GetEmpty();
             }));
 
-    // 10ch専用: Ch4 CCT->RGBW Crossfade
-    AddLabeledRow(LOCTEXT("DMX10ChCrossfade", "10ch Ch4 Crossfade"),
-        SNew(SSpinBox<int32>)
-            .MinValue(0).MaxValue(255).Delta(1)
-            .Value_Lambda([W]() -> int32 {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return W->DMXOutput->FixtureMappings[0].CCTRGBW10_Crossfade;
-                return 255;
+    // ソルバの出力 (送信値と状態)
+    AddLabeledRow(LOCTEXT("DMXOutputStatus", "出力"),
+        SNew(STextBlock)
+            .Text_Lambda([W]() -> FText {
+                if (!W.IsValid() || !W->DMXOutput || W->DMXOutput->FixtureStatus.Num() == 0)
+                    return LOCTEXT("DMXNoStatus", "(未送信)");
+                const FLightSyncFixtureStatus& St = W->DMXOutput->FixtureStatus[0];
+                FString Values;
+                for (uint8 V : St.Values)
+                {
+                    Values += FString::Printf(TEXT("%d "), V);
+                }
+                FString Flags;
+                if (St.bOutOfGamut) Flags += TEXT("  [色域外: 彩度を下げて出力]");
+                if (St.bClipped) Flags += TEXT("  [明るさ上限]");
+                return FText::FromString(FString::Printf(TEXT("%s (強さ %.0f%%)%s"), *Values.TrimEnd(), St.Intensity * 100.0f, *Flags));
             })
-            .OnValueChanged_Lambda([W](int32 V) {
-                MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].CCTRGBW10_Crossfade = V;
-            }));
-
-    // 10ch専用: Ch9 Strobe
-    AddLabeledRow(LOCTEXT("DMX10ChStrobe", "10ch Ch9 Strobe"),
-        SNew(SSpinBox<int32>)
-            .MinValue(0).MaxValue(255).Delta(1)
-            .Value_Lambda([W]() -> int32 {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return W->DMXOutput->FixtureMappings[0].CCTRGBW10_Strobe;
-                return 0;
-            })
-            .OnValueChanged_Lambda([W](int32 V) {
-                MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].CCTRGBW10_Strobe = V;
-            }));
-
-    // 10ch専用: Ch10 Reserved
-    AddLabeledRow(LOCTEXT("DMX10ChReserved", "10ch Ch10 Reserved"),
-        SNew(SSpinBox<int32>)
-            .MinValue(0).MaxValue(255).Delta(1)
-            .Value_Lambda([W]() -> int32 {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return W->DMXOutput->FixtureMappings[0].CCTRGBW10_Reserved10;
-                return 0;
-            })
-            .OnValueChanged_Lambda([W](int32 V) {
-                MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].CCTRGBW10_Reserved10 = V;
+            .ColorAndOpacity_Lambda([W]() -> FSlateColor {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureStatus.Num() > 0
+                    && (W->DMXOutput->FixtureStatus[0].bOutOfGamut || W->DMXOutput->FixtureStatus[0].bClipped))
+                    return FSlateColor(FLinearColor(1.0f, 0.75f, 0.3f));
+                return FSlateColor::UseForeground();
             }));
 
     // マスターディマー (個別)

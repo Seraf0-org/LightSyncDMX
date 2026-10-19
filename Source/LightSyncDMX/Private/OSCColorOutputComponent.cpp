@@ -191,13 +191,70 @@ void UOSCColorOutputComponent::SendToTarget(int32 TargetIndex, const FLinearColo
     SendFormattedMessage(Client, Config, Color);
 }
 
+void UOSCColorOutputComponent::ResolveTargetValues(const FOSCTargetConfig &Config, const FLinearColor &Color,
+                                                   FLinearColor &OutRGB, TArray<uint8> &OutDMX) const
+{
+    const FLinearColor Target = Color * FMath::Max(Config.IntensityGain, 0.0f);
+
+    // 色相を保って 1.0 以下に収める
+    auto FitToUnit = [](FLinearColor C)
+    {
+        C.R = FMath::Max(C.R, 0.0f);
+        C.G = FMath::Max(C.G, 0.0f);
+        C.B = FMath::Max(C.B, 0.0f);
+        const float Peak = FMath::Max3(C.R, C.G, C.B);
+        if (Peak > 1.0f)
+        {
+            C /= Peak;
+        }
+        C.A = 1.0f;
+        return C;
+    };
+
+    switch (Config.ValueMode)
+    {
+    case EOSCColorValue::FixtureLevels:
+    {
+        const FLightSyncFixtureProfileData Profile = Config.Profile ? Config.Profile->Profile
+                                                                    : LightSyncFixture::MakePreset(ELightSyncColorMode::RGB);
+        const LightSyncColor::FMatrix3x3 RefToCamera = StageCalibration ? StageCalibration->GetReferenceToCamera()
+                                                                        : LightSyncColor::FMatrix3x3::Identity();
+        const FLightSyncFixtureOutput Output = LightSyncFixture::Compute(Profile, Target, RefToCamera, 1.0);
+        OutDMX = Output.Values;
+        auto ValueAt = [&OutDMX](int32 Index) { return OutDMX.IsValidIndex(Index) ? OutDMX[Index] / 255.0f : 0.0f; };
+        OutRGB = FLinearColor(ValueAt(0), ValueAt(1), ValueAt(2), 1.0f);
+        return;
+    }
+    case EOSCColorValue::DisplayEncodedTarget:
+    {
+        // IEC 61966-2-1 sRGB OETF
+        auto Encode = [](float V) { return V <= 0.0031308f ? 12.92f * V : 1.055f * FMath::Pow(V, 1.0f / 2.4f) - 0.055f; };
+        const FLinearColor Linear = FitToUnit(Target);
+        OutRGB = FLinearColor(Encode(Linear.R), Encode(Linear.G), Encode(Linear.B), 1.0f);
+        break;
+    }
+    default:
+        OutRGB = FitToUnit(Target);
+        break;
+    }
+
+    OutDMX = {static_cast<uint8>(FMath::RoundToInt(OutRGB.R * 255.0f)),
+              static_cast<uint8>(FMath::RoundToInt(OutRGB.G * 255.0f)),
+              static_cast<uint8>(FMath::RoundToInt(OutRGB.B * 255.0f))};
+}
+
 void UOSCColorOutputComponent::SendFormattedMessage(
-    UOSCClient *Client, const FOSCTargetConfig &Config, const FLinearColor &Color)
+    UOSCClient *Client, const FOSCTargetConfig &Config, const FLinearColor &InColor)
 {
     if (!Client)
     {
         return;
     }
+
+    // ValueMode に従って送る値を決める (以降の Color は 0-1 の送信値)
+    FLinearColor Color;
+    TArray<uint8> DMXValues;
+    ResolveTargetValues(Config, InColor, Color, DMXValues);
 
     // プローブ名をOSCアドレスセーフにする (スペース→アンダースコア)
     FString SafeProbeName = OSCProbeName;
@@ -253,7 +310,7 @@ void UOSCColorOutputComponent::SendFormattedMessage(
 
     case EOSCMessageFormat::DasLightCompat:
     {
-        SendDasLightFormat(Client, Config, Color);
+        SendDasLightFormat(Client, Config, DMXValues);
         break;
     }
 
@@ -344,58 +401,38 @@ void UOSCColorOutputComponent::SendQLCPlusFormat(
 }
 
 void UOSCColorOutputComponent::SendDasLightFormat(
-    UOSCClient *Client, const FOSCTargetConfig &Config, const FLinearColor &Color)
+    UOSCClient *Client, const FOSCTargetConfig &Config, const TArray<uint8> &Values)
 {
     if (!Client)
         return;
 
-    // DasLight は /dmx/{universe}/{channel} [int 0-255] 形式
-    const int32 R = FMath::RoundToInt(FMath::Clamp(Color.R, 0.0f, 1.0f) * 255);
-    const int32 G = FMath::RoundToInt(FMath::Clamp(Color.G, 0.0f, 1.0f) * 255);
-    const int32 B = FMath::RoundToInt(FMath::Clamp(Color.B, 0.0f, 1.0f) * 255);
-
+    // DasLight は /dmx/{universe}/{channel} [int 0-255] 形式。プロファイルの全チャンネルを送る
     const int32 Univ = Config.DMXUniverse;
     const int32 Ch = Config.DMXStartChannel;
+
+    auto MakeMessage = [Univ, Ch](int32 Offset, uint8 Value)
+    {
+        FOSCMessage Msg;
+        Msg.SetAddress(FOSCAddress(*FString::Printf(TEXT("/dmx/%d/%d"), Univ, Ch + Offset)));
+        UOSCManager::AddInt32(Msg, Value);
+        return Msg;
+    };
 
     if (bUseBundleMessage)
     {
         FOSCBundle Bundle;
-
-        FOSCMessage MsgR;
-        MsgR.SetAddress(FOSCAddress(*FString::Printf(TEXT("/dmx/%d/%d"), Univ, Ch)));
-        UOSCManager::AddInt32(MsgR, R);
-        UOSCManager::AddMessageToBundle(MsgR, Bundle);
-
-        FOSCMessage MsgG;
-        MsgG.SetAddress(FOSCAddress(*FString::Printf(TEXT("/dmx/%d/%d"), Univ, Ch + 1)));
-        UOSCManager::AddInt32(MsgG, G);
-        UOSCManager::AddMessageToBundle(MsgG, Bundle);
-
-        FOSCMessage MsgB;
-        MsgB.SetAddress(FOSCAddress(*FString::Printf(TEXT("/dmx/%d/%d"), Univ, Ch + 2)));
-        UOSCManager::AddInt32(MsgB, B);
-        UOSCManager::AddMessageToBundle(MsgB, Bundle);
-
+        for (int32 Offset = 0; Offset < Values.Num(); ++Offset)
+        {
+            FOSCMessage Msg = MakeMessage(Offset, Values[Offset]);
+            UOSCManager::AddMessageToBundle(Msg, Bundle);
+        }
         Client->SendOSCBundle(Bundle);
     }
     else
     {
+        for (int32 Offset = 0; Offset < Values.Num(); ++Offset)
         {
-            FOSCMessage Msg;
-            Msg.SetAddress(FOSCAddress(*FString::Printf(TEXT("/dmx/%d/%d"), Univ, Ch)));
-            UOSCManager::AddInt32(Msg, R);
-            Client->SendOSCMessage(Msg);
-        }
-        {
-            FOSCMessage Msg;
-            Msg.SetAddress(FOSCAddress(*FString::Printf(TEXT("/dmx/%d/%d"), Univ, Ch + 1)));
-            UOSCManager::AddInt32(Msg, G);
-            Client->SendOSCMessage(Msg);
-        }
-        {
-            FOSCMessage Msg;
-            Msg.SetAddress(FOSCAddress(*FString::Printf(TEXT("/dmx/%d/%d"), Univ, Ch + 2)));
-            UOSCManager::AddInt32(Msg, B);
+            FOSCMessage Msg = MakeMessage(Offset, Values[Offset]);
             Client->SendOSCMessage(Msg);
         }
     }

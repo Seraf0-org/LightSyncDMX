@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "LightSyncZones.h"
+#include "LightSyncFixtureProfile.h"
 #include "OSCColorOutputComponent.generated.h"
 
 class UOSCClient;
@@ -35,6 +36,24 @@ enum class EOSCMessageFormat : uint8
     Custom UMETA(DisplayName = "Custom Address"),
 };
 
+/** OSC で送る値の種類 */
+UENUM(BlueprintType)
+enum class EOSCColorValue : uint8
+{
+    /**
+     * 灯体プロファイルとソルバで解いた DMX レベル (0-1)。
+     * 受け側ソフトが値をそのまま灯体に流す場合に正しい色になる (既定)。
+     * DasLight 形式ではプロファイルの全チャンネルを送る。
+     */
+    FixtureLevels UMETA(DisplayName = "Fixture Levels (Solved)"),
+
+    /** 目標色そのもの (リニア、色相を保って 1.0 以下に収める) */
+    LinearTarget UMETA(DisplayName = "Target (Linear)"),
+
+    /** 目標色を sRGB でエンコード (受け側が sRGB 値を期待する場合) */
+    DisplayEncodedTarget UMETA(DisplayName = "Target (sRGB Encoded)"),
+};
+
 /**
  * FOSCTargetConfig
  * 送信先PC/アプリの設定
@@ -63,6 +82,18 @@ struct LIGHTSYNCDMX_API FOSCTargetConfig
     /** 送信フォーマット */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC")
     EOSCMessageFormat Format = EOSCMessageFormat::FloatRGB;
+
+    /** 送る値の種類 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC")
+    EOSCColorValue ValueMode = EOSCColorValue::FixtureLevels;
+
+    /** FixtureLevels で使う灯体プロファイル。未設定なら RGB プリセット (先頭 3 チャンネルを R,G,B として送る) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC", meta = (EditCondition = "ValueMode == EOSCColorValue::FixtureLevels"))
+    TObjectPtr<ULightSyncFixtureProfile> Profile;
+
+    /** 強さのゲイン (リニア) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+    float IntensityGain = 1.0f;
 
     /** OSCアドレスのプレフィックス (例: /lightsync) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC")
@@ -106,6 +137,10 @@ public:
     UOSCColorOutputComponent();
 
     // === 設定 ===
+
+    /** ステージのキャリブレーション (基準 → カメラ)。FixtureLevels で使う。未設定なら単位行列 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC|Config")
+    TObjectPtr<ULightSyncStageCalibration> StageCalibration;
 
     /** 送信先ターゲットの一覧 (複数PCに同時送信可能) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC|Config")
@@ -216,8 +251,11 @@ private:
     /** QLC+ 互換フォーマットで送信 */
     void SendQLCPlusFormat(UOSCClient *Client, const FOSCTargetConfig &Config, const FLinearColor &Color);
 
-    /** DasLight 互換フォーマットで送信 */
-    void SendDasLightFormat(UOSCClient *Client, const FOSCTargetConfig &Config, const FLinearColor &Color);
+    /** DasLight 互換フォーマットで送信 (Values: チャンネル値 0-255、先頭チャンネルから) */
+    void SendDasLightFormat(UOSCClient *Client, const FOSCTargetConfig &Config, const TArray<uint8> &Values);
+
+    /** ターゲットの ValueMode に従って送る RGB (0-1) と DMX 値列を作る */
+    void ResolveTargetValues(const FOSCTargetConfig &Config, const FLinearColor &Color, FLinearColor &OutRGB, TArray<uint8> &OutDMX) const;
 
     /** 最後にOSCを送信した時刻 */
     double LastOSCSendTimeSeconds = -1.0;

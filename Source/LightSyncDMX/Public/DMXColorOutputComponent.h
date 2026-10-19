@@ -6,30 +6,10 @@
 #include "Components/ActorComponent.h"
 #include "DMXProtocolCommon.h"
 #include "LightSyncZones.h"
+#include "LightSyncFixtureProfile.h"
 #include "DMXColorOutputComponent.generated.h"
 
 class UDMXLibrary;
-
-/**
- * ELightSyncColorMode
- * DMXチャンネルへの色の割り当て方式
- */
-UENUM(BlueprintType)
-enum class ELightSyncColorMode : uint8
-{
-    /** R, G, B の3チャンネル */
-    RGB UMETA(DisplayName = "RGB (3ch)"),
-    /** R, G, B, W の4チャンネル */
-    RGBW UMETA(DisplayName = "RGBW (4ch)"),
-    /** R, G, B, Amber, White の5チャンネル */
-    RGBAW UMETA(DisplayName = "RGBAW (5ch)"),
-    /** Dimmer, R, G, B の4チャンネル (Dimmer先頭) */
-    DRGB UMETA(DisplayName = "Dimmer+RGB (4ch)"),
-    /** 色温度 + 明度 の2チャンネル */
-    CCT UMETA(DisplayName = "CCT+Brightness (2ch)"),
-    /** 10ch: CCT/GreenMagenta/Dimmer/Crossfade/R/G/B/W/Strobe/Reserved */
-    CCTRGBW10CH UMETA(DisplayName = "CCT & RGBW (10ch)"),
-};
 
 /**
  * FDMXFixtureMapping
@@ -56,47 +36,63 @@ struct LIGHTSYNCDMX_API FDMXFixtureMapping
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX", meta = (ClampMin = "1", ClampMax = "512"))
     int32 StartChannel = 1;
 
-    /** カラーモード */
+    /**
+     * 灯体プロファイル (エミッタの応答・チャンネル配置・調光カーブ)。
+     * 未設定なら下の内蔵プリセット (理想的な Rec.709 エミッタ) を使う。
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX")
+    TObjectPtr<ULightSyncFixtureProfile> Profile;
+
+    /** 内蔵プリセット (Profile 未設定時) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX", meta = (EditCondition = "Profile == nullptr"))
     ELightSyncColorMode ColorMode = ELightSyncColorMode::RGB;
 
     /** 有効フラグ */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX")
     bool bEnabled = true;
 
-    /** 個別の明度オフセット (0.0 - 2.0) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+    /**
+     * 強さのゲイン (リニア)。目標の正規化照度 1.0 を、この灯体の何倍の出力で再現するか。
+     * 灯体の距離・大きさの違いを吸収する。キャリブレーションで求める。
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX", meta = (ClampMin = "0.0", ClampMax = "100.0"))
     float BrightnessScale = 1.0f;
+};
 
-    /** CCTチャンネル値 0 に対応する色温度 (K) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCT", meta = (ClampMin = "1000", ClampMax = "20000", EditCondition = "ColorMode==ELightSyncColorMode::CCT || ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
-    float CCTMinKelvin = 2700.0f;
+/** フィクスチャごとの直近の出力状態 (モニター・診断用) */
+USTRUCT(BlueprintType)
+struct LIGHTSYNCDMX_API FLightSyncFixtureStatus
+{
+    GENERATED_BODY()
 
-    /** CCTチャンネル値 255 に対応する色温度 (K) - 灯体の仕様に合わせる (例: 10ch灯体は 7500K が多い) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCT", meta = (ClampMin = "1000", ClampMax = "20000", EditCondition = "ColorMode==ELightSyncColorMode::CCT || ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
-    float CCTMaxKelvin = 6500.0f;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DMX")
+    FString FixtureName;
 
-    /** 10chモード: Ch2 Green/Magenta 制御値 (0-255, 0=Neutral/No Effect) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
-    int32 CCTRGBW10_GreenMagenta = 0;
+    /** 灯体の色域外 (色相を保って彩度を下げた / CCT 灯体のレンジ外) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DMX")
+    bool bOutOfGamut = false;
 
-    /** 10chモード: Ch4 CCT↔RGBW クロスフェード (0=CCT, 255=RGBW) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
-    int32 CCTRGBW10_Crossfade = 255;
+    /** 明るさが上限を超えた (等倍で下げた) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DMX")
+    bool bClipped = false;
 
-    /** 10chモード: Ch9 ストロボ値 (0=OFF) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
-    int32 CCTRGBW10_Strobe = 0;
+    /** 全体の明るさ (0-1) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DMX")
+    float Intensity = 0.0f;
 
-    /** 10chモード: Ch10 予備チャンネル値 */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
-    int32 CCTRGBW10_Reserved10 = 0;
+    /** CCT 灯体の色温度 (K) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DMX")
+    float CCT = 0.0f;
+
+    /** 送信した DMX 値 (先頭チャンネルから) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DMX")
+    TArray<uint8> Values;
 };
 
 /**
  * UDMXColorOutputComponent
  *
- * サンプリングされた色をDMXプロトコルで送信するコンポーネント。
+ * ゾーンの目標色を、灯体プロファイルとソルバで DMX 値に変換して送信するコンポーネント。
  * UEのDMXProtocolプラグインを使用してArt-Net / sACN で送信。
  * 1つのプローブから複数のフィクスチャに同時出力可能。
  */
@@ -117,21 +113,29 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|Config")
     TSoftObjectPtr<UDMXLibrary> DMXLibrary;
 
-    /** 出力先フィクスチャのマッピングリスト */
+    /** ステージのキャリブレーション (基準 → カメラ)。未設定なら単位行列 */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|Config")
+    TObjectPtr<ULightSyncStageCalibration> StageCalibration;
+
+    /** 出力先フィクスチャのマッピングリスト */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|Config", meta = (TitleProperty = "FixtureName"))
     TArray<FDMXFixtureMapping> FixtureMappings;
 
     /** DMX出力が有効か */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|Config")
     bool bDMXOutputEnabled = true;
 
-    /** マスターディマー値 (0-255 に対応) */
+    /** マスターディマー (0-1)。目標の強さに掛ける (色は変えない) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|Config", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float MasterDimmer = 1.0f;
 
     /** 最後に送信した色 */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DMX|Output")
     FLinearColor LastSentColor;
+
+    /** フィクスチャごとの直近の出力 (FixtureMappings と同じ並び) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "DMX|Output")
+    TArray<FLightSyncFixtureStatus> FixtureStatus;
 
     /** 送信成功フレームカウンタ */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DMX|Output")
@@ -151,6 +155,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "DMX")
     void SendColorToFixture(const FLinearColor &Color, int32 FixtureIndex);
 
+    /** 特定のフィクスチャに生の DMX 値を送る (キャリブレーションのテスト点灯用。値は先頭チャンネルから) */
+    UFUNCTION(BlueprintCallable, Category = "DMX")
+    void SendRawToFixture(int32 FixtureIndex, const TArray<uint8> &Values);
+
     /** 全フィクスチャをブラックアウト */
     UFUNCTION(BlueprintCallable, Category = "DMX")
     void Blackout();
@@ -163,15 +171,25 @@ public:
     UFUNCTION(BlueprintCallable, Category = "DMX")
     void RemoveFixtureMapping(int32 Index);
 
-    /** カラーモードが使用するチャンネル数 */
+    /** 内蔵プリセットが使用するチャンネル数 */
     UFUNCTION(BlueprintPure, Category = "DMX")
     static int32 GetChannelCount(ELightSyncColorMode Mode);
+
+    /** マッピングが使用するチャンネル数 (プロファイル優先) */
+    UFUNCTION(BlueprintPure, Category = "DMX")
+    static int32 GetMappingChannelCount(const FDMXFixtureMapping &Mapping);
 
     /** マッピングがユニバース内 (1-512) に収まっているか */
     UFUNCTION(BlueprintPure, Category = "DMX")
     static bool IsMappingInRange(const FDMXFixtureMapping &Mapping);
 
-    /** FLinearColorからDMXチャンネル値 (絶対チャンネル番号 → 値) へ変換。MasterDimmer / BrightnessScale 適用済み */
+    /** マッピングが使うプロファイル (アセット or 内蔵プリセット) */
+    static FLightSyncFixtureProfileData GetMappingProfile(const FDMXFixtureMapping &Mapping);
+
+    /** 目標色 → 灯体 1 台分の出力 (MasterDimmer / BrightnessScale / キャリブレーション適用済み) */
+    FLightSyncFixtureOutput ComputeFixtureOutput(const FDMXFixtureMapping &Mapping, const FLinearColor &Color) const;
+
+    /** FLinearColorからDMXチャンネル値 (絶対チャンネル番号 → 値) へ変換 */
     TMap<int32, uint8> ColorToDMXChannels(const FDMXFixtureMapping &Mapping, const FLinearColor &Color) const;
 
 protected:
@@ -179,14 +197,11 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
-    /** 色をDMXチャンネル値に変換して送信 */
-    void SendDMXData(const FDMXFixtureMapping &Mapping, const FLinearColor &Color);
+    /** 目標色を計算して送信し、状態を記録 */
+    void SendFixture(int32 MappingIndex, const FLinearColor &Color);
 
-    /** RGB → RGBW 変換 */
-    void RGBtoRGBW(float R, float G, float B, float &OutR, float &OutG, float &OutB, float &OutW) const;
-
-    /** RGB → 色温度(CCT, Min-Max を 0-1 に正規化) + 明度 変換 */
-    void RGBtoCCTBrightness(const FDMXFixtureMapping &Mapping, float R, float G, float B, float &OutCCT, float &OutBrightness) const;
+    /** オフセット順の値を絶対チャンネルにして送信 */
+    void SendValues(const FDMXFixtureMapping &Mapping, const TArray<uint8> &Values);
 
     /** 送信先の出力ポートを取得 (DMXLibrary 指定時はそのポートのみ) */
     void GatherOutputPorts(TArray<FDMXOutputPortSharedRef> &OutPorts);
