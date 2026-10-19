@@ -2,6 +2,7 @@
 
 #include "LightSyncSubsystem.h"
 #include "LightProbeActor.h"
+#include "LightColorSamplerComponent.h"
 #include "DMXColorOutputComponent.h"
 #include "OSCColorOutputComponent.h"
 #include "LightSyncDMXModule.h"
@@ -9,6 +10,7 @@
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
 #include "EngineUtils.h"
+#include "LightSyncSettings.h"
 
 void ULightSyncSubsystem::Initialize(FSubsystemCollectionBase &Collection)
 {
@@ -215,6 +217,54 @@ void ULightSyncSubsystem::SetMasterDimmer(float Dimmer)
             }
         }
     }
+}
+
+bool ULightSyncSubsystem::TryReserveCapture(const ALightProbeActor *Probe)
+{
+    const uint64 Frame = GFrameCounter;
+    if (CaptureFrame != Frame)
+    {
+        CaptureFrame = Frame;
+        CapturesThisFrame = 0;
+    }
+
+    const int32 Max = GetDefault<ULightSyncSettings>()->MaxCapturesPerFrame;
+    if (Max <= 0)
+    {
+        CaptureWaiters.Reset();
+        ++CapturesThisFrame;
+        return true;
+    }
+
+    // 待っているプローブは毎フレーム要求し直す。前のフレームに要求しなかったもの (止まった・消えた) は外す
+    CaptureWaiters.RemoveAll([Frame](const FCaptureWaiter &Waiter)
+                             { return !Waiter.Probe.IsValid() || Waiter.LastRequestFrame + 1 < Frame; });
+
+    const int32 WaitIndex = CaptureWaiters.IndexOfByPredicate([Probe](const FCaptureWaiter &Waiter)
+                                                              { return Waiter.Probe.Get() == Probe; });
+    const int32 Free = Max - CapturesThisFrame;
+
+    // 空き枠は待っている順に割り当てる。待っていないプローブは、待っている数より空きが多いときだけ
+    const bool bGrant = WaitIndex != INDEX_NONE ? WaitIndex < Free : CaptureWaiters.Num() < Free;
+    if (bGrant)
+    {
+        if (WaitIndex != INDEX_NONE)
+        {
+            CaptureWaiters.RemoveAt(WaitIndex);
+        }
+        ++CapturesThisFrame;
+        return true;
+    }
+
+    if (WaitIndex != INDEX_NONE)
+    {
+        CaptureWaiters[WaitIndex].LastRequestFrame = Frame;
+    }
+    else
+    {
+        CaptureWaiters.Add({Probe, Frame});
+    }
+    return false;
 }
 
 void ULightSyncSubsystem::DumpProbeStatus() const

@@ -71,6 +71,14 @@ struct LIGHTSYNCDMX_API FLightSyncCalibrationStep
     /** WallPatch: 記録時にプローブが測った基準値 (正規化照度) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Calibration")
     FLinearColor ProbeReference = FLinearColor::Black;
+
+    /** WallPatch: 記録時にプローブが使っていた壁の補正ガンマ (再キャリブレーション時に元に戻すため) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Calibration")
+    float ReferenceGammaAtRecord = 1.0f;
+
+    /** WallPatch: 記録時のプローブが Wall モードだったか */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Calibration")
+    bool bRecordedInWallMode = true;
 };
 
 /**
@@ -208,9 +216,12 @@ public:
     static bool FitFixtureFromSteps(const FLightSyncFixtureProfileData &Base, const TArray<FLightSyncCalibrationStep> &Steps,
                                     ELightSyncCameraTransfer Transfer, FLightSyncFixtureProfileData &OutProfile, FString &OutReport);
 
-    /** 壁の測定 → M_ref の列 */
+    /**
+     * 壁の測定 → M_ref の列と、壁の応答の補正ガンマ。
+     * 灰色の段階パッチが 3 つ以上あれば camera ≈ c·(T^g − T_black^g) で g を求め、基準値を T^g にしてから M_ref を求める。
+     */
     static bool FitStageFromSteps(const TArray<FLightSyncCalibrationStep> &Steps, ELightSyncCameraTransfer Transfer,
-                                  FLinearColor &OutRed, FLinearColor &OutGreen, FLinearColor &OutBlue, FString &OutReport);
+                                  FLinearColor &OutRed, FLinearColor &OutGreen, FLinearColor &OutBlue, float &OutGamma, FString &OutReport);
 
     /** プロファイルから灯体の測定手順を作る */
     static TArray<FLightSyncCalibrationStep> MakeFixtureSteps(const FLightSyncFixtureProfileData &Profile);

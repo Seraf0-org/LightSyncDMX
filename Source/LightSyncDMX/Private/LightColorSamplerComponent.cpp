@@ -7,6 +7,7 @@
 #include "ColorManagement/ColorSpace.h"
 #include "Engine/TextureRenderTargetCube.h"
 #include "HAL/PlatformTime.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 ULightColorSamplerComponent::ULightColorSamplerComponent()
 {
@@ -76,8 +77,15 @@ void ULightColorSamplerComponent::ResetZonesToDefault()
     LastZoneNames.Reset();
 }
 
-void ULightColorSamplerComponent::SampleFromRenderTarget(UTextureRenderTargetCube *InCubeRT, const FLightSyncSampleContext &Context)
+bool ULightColorSamplerComponent::CanDispatch() const
 {
+    return bSamplingEnabled && !(GPUSampler && GPUSampler->IsBusy());
+}
+
+void ULightColorSamplerComponent::Dispatch(UTextureRenderTargetCube *InCubeRT, const FLightSyncSampleContext &Context)
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(LightSync_SamplerDispatch);
+
     if (!bSamplingEnabled || !InCubeRT)
     {
         return;
@@ -94,21 +102,51 @@ void ULightColorSamplerComponent::SampleFromRenderTarget(UTextureRenderTargetCub
         : UE::Color::FColorSpace::GetWorking().GetLuminanceFactors();
 
     const TArray<FLightSyncZone> Active = GetActiveZones();
-    const LightSyncZones::FSetup Setup = LightSyncZones::BuildSetup(Active, Context.ProbeRotation, PartitionSharpness,
-                                                                    FVector3f(LumFactors.R, LumFactors.G, LumFactors.B),
-                                                                    Context.InputTransfer);
+    LightSyncZones::FSetup Setup = LightSyncZones::BuildSetup(Active, Context.ProbeRotation, PartitionSharpness,
+                                                              FVector3f(LumFactors.R, LumFactors.G, LumFactors.B),
+                                                              Context.InputTransfer);
+    Setup.TransferGamma = Context.TransferGamma;
+
     GPUSampler->SetSetup(Setup);
     GPUSampler->SetForceCPUSync(SamplingMethod == ELightSyncSamplingMethod::CPUSync);
     GPUSampler->DispatchSampling(InCubeRT);
 
-    LightSyncZones::FResult Result;
-    if (GPUSampler->TryGetNewResult(Result))
+    PendingContext = Context;
+    DispatchTime = FPlatformTime::Seconds();
+    LastSetup = Setup;
+    LastRenderTarget = InCubeRT;
+}
+
+bool ULightColorSamplerComponent::PollNewResult()
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(LightSync_SamplerPoll);
+
+    if (!GPUSampler)
     {
-        LastRawResult = Result;
-        LastSetup = Setup;
-        LastRenderTarget = InCubeRT;
-        ApplyNewResult(Result, Context);
+        return false;
     }
+
+    GPUSampler->Poll();
+
+    LightSyncZones::FResult Result;
+    if (!GPUSampler->TryGetNewResult(Result))
+    {
+        return false;
+    }
+
+    LastResultLatencyMs = static_cast<float>((FPlatformTime::Seconds() - DispatchTime) * 1000.0);
+    LastRawResult = Result;
+    ApplyNewResult(Result, PendingContext);
+    return true;
+}
+
+void ULightColorSamplerComponent::SampleFromRenderTarget(UTextureRenderTargetCube *InCubeRT, const FLightSyncSampleContext &Context)
+{
+    if (CanDispatch())
+    {
+        Dispatch(InCubeRT, Context);
+    }
+    PollNewResult();
 }
 
 void ULightColorSamplerComponent::ApplyNewResult(const LightSyncZones::FResult &Result, const FLightSyncSampleContext &Context)

@@ -35,6 +35,12 @@ public:
     /** キューブマップの積分を GPU (or CPU) にディスパッチ */
     void DispatchSampling(UTextureRenderTargetCube* CubeRT);
 
+    /** 前回の GPU 積分の結果待ちか (待っている間にキャプチャしても使われない) */
+    bool IsBusy() const { return bInitialized && !ShouldUseCPUPath() && bDispatched; }
+
+    /** 結果待ちならリードバックの完了を確認する (レンダースレッドで。毎フレーム呼んでよい) */
+    void Poll();
+
     /**
      * 新しい結果があれば OutResult に入れて true を返す。
      * OutResult.Zones の数はディスパッチ時点のゾーン数 (設定変更直後は現在の設定と違うことがある)。
@@ -44,10 +50,20 @@ public:
     /** CPU でキューブマップを読み出す (検証用。ゲームスレッドで同期読み出しするので重い) */
     static bool ReadCubeTexels(UTextureRenderTargetCube* CubeRT, TArray<FLinearColor> (&OutFaces)[6], int32& OutSize);
 
-    /** GPU の出力バッファのレイアウト: ピーク 6 + 重心 6 + 面 6 × MaxZones */
-    static constexpr int32 RefineBase = 6;
-    static constexpr int32 ZonesBase = 12;
-    static constexpr int32 NumOutputElements = ZonesBase + 6 * LightSyncZones::MaxZones;
+    /**
+     * GPU の出力バッファのレイアウト (LightSyncAverageCS.usf と一致させる):
+     *   [0..5] 面ごとのピーク, [6] 重心の合計, [8..15] ゾーンの合計 ← CPU に読み戻すのはここまで
+     *   [16..] グループごとの部分和 (重心 MaxGroups 個, ゾーン MaxGroups × MaxZones 個)
+     */
+    static constexpr int32 RefineTotal = 6;
+    static constexpr int32 ZonesTotal = 8;
+    static constexpr int32 ReadbackElements = ZonesTotal + LightSyncZones::MaxZones;
+    static constexpr int32 MaxGroupsPerSide = 8;
+    static constexpr int32 MaxGroups = 6 * MaxGroupsPerSide * MaxGroupsPerSide;
+    static constexpr int32 NumOutputElements = 16 + MaxGroups + MaxGroups * LightSyncZones::MaxZones;
+
+    /** 1 面あたりのグループ数 (1 辺)。16×16 スレッドが 1 texel ずつ受け持つ程度まで分ける */
+    static int32 GetGroupsPerSide(int32 TextureSize) { return FMath::Clamp((TextureSize + 15) / 16, 1, MaxGroupsPerSide); }
 
 private:
     LightSyncZones::FSetup Setup;
@@ -69,7 +85,7 @@ private:
     struct FReadbackSharedState
     {
         mutable FCriticalSection Lock;
-        FVector4f RawData[NumOutputElements];
+        FVector4f RawData[ReadbackElements];
         int32 NumZones = 0;
         bool bDataReady = false;
     };

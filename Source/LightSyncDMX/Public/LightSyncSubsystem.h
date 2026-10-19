@@ -89,6 +89,12 @@ public:
     UFUNCTION(BlueprintCallable, Category = "LightSync")
     void ForceSampleAll();
 
+    /**
+     * このフレームのキャプチャ枠を 1 つ確保する (Project Settings の Max Captures Per Frame)。
+     * 枠が足りずに待たされたプローブは、次のフレームで先に枠を得る (Tick 順に関係なく公平に)。
+     */
+    bool TryReserveCapture(const ALightProbeActor *Probe);
+
     /** マスターディマーを全プローブの DMX / OSC 出力に設定 */
     UFUNCTION(BlueprintCallable, Category = "LightSync")
     void SetMasterDimmer(float Dimmer);
@@ -107,6 +113,17 @@ private:
     /** 登録済みプローブの配列 */
     UPROPERTY()
     TArray<TWeakObjectPtr<ALightProbeActor>> RegisteredProbes;
+
+    uint64 CaptureFrame = 0;
+    int32 CapturesThisFrame = 0;
+
+    /** キャプチャ枠を待っているプローブ (待たされた順) */
+    struct FCaptureWaiter
+    {
+        TWeakObjectPtr<const ALightProbeActor> Probe;
+        uint64 LastRequestFrame = 0;
+    };
+    TArray<FCaptureWaiter> CaptureWaiters;
 
     /** 無効な(GC済み)プローブを除去 */
     void CleanupInvalidProbes();

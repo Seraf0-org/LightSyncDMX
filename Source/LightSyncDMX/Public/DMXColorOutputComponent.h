@@ -184,7 +184,7 @@ public:
     static bool IsMappingInRange(const FDMXFixtureMapping &Mapping);
 
     /** マッピングが使うプロファイル (アセット or 内蔵プリセット) */
-    static FLightSyncFixtureProfileData GetMappingProfile(const FDMXFixtureMapping &Mapping);
+    static const FLightSyncFixtureProfileData &GetMappingProfile(const FDMXFixtureMapping &Mapping);
 
     /** 目標色 → 灯体 1 台分の出力 (MasterDimmer / BrightnessScale / キャリブレーション適用済み) */
     FLightSyncFixtureOutput ComputeFixtureOutput(const FDMXFixtureMapping &Mapping, const FLinearColor &Color) const;
@@ -200,8 +200,13 @@ private:
     /** 目標色を計算して送信し、状態を記録 */
     void SendFixture(int32 MappingIndex, const FLinearColor &Color);
 
-    /** オフセット順の値を絶対チャンネルにして送信 */
-    void SendValues(const FDMXFixtureMapping &Mapping, const TArray<uint8> &Values);
+    /**
+     * オフセット順の値を絶対チャンネルにして送信。
+     * この PC が送信役でなければ送らない (bBypassAuthority = キャリブレーションのテスト点灯)。
+     * BlackoutValues を渡すと、終了時の直接ブラックアウト用にチャンネルを記録する。
+     */
+    void SendValues(const FDMXFixtureMapping &Mapping, const TArray<uint8> &Values,
+                    const TArray<uint8> *BlackoutValues = nullptr, bool bBypassAuthority = false);
 
     /** 送信先の出力ポートを取得 (DMXLibrary 指定時はそのポートのみ) */
     void GatherOutputPorts(TArray<FDMXOutputPortSharedRef> &OutPorts);

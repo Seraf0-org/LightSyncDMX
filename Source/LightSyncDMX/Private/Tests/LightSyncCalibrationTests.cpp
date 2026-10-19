@@ -75,7 +75,7 @@ bool FLightSyncCalStepsTest::RunTest(const FString &Parameters)
     TestEqual(TEXT("RGBW: off + 4 emitters + 4 levels"), RGBW.Num(), 9);
     const TArray<FLightSyncCalibrationStep> CCT = ULightSyncCalibrator::MakeFixtureSteps(LightSyncFixture::MakePreset(ELightSyncColorMode::CCT));
     TestEqual(TEXT("CCT: off + white + 4 levels"), CCT.Num(), 6);
-    TestEqual(TEXT("wall: black + R G B W"), ULightSyncCalibrator::MakeWallSteps().Num(), 5);
+    TestEqual(TEXT("wall: black + R G B W + 4 gray"), ULightSyncCalibrator::MakeWallSteps().Num(), 9);
     return true;
 }
 
@@ -160,8 +160,10 @@ bool FLightSyncCalStageTest::RunTest(const FString &Parameters)
     }
 
     FLinearColor R, G, B;
+    float Gamma = 0.0f;
     FString Report;
-    TestTrue(TEXT("fit ok"), ULightSyncCalibrator::FitStageFromSteps(Steps, ELightSyncCameraTransfer::Linear, R, G, B, Report));
+    TestTrue(TEXT("fit ok"), ULightSyncCalibrator::FitStageFromSteps(Steps, ELightSyncCameraTransfer::Linear, R, G, B, Gamma, Report));
+    TestTrue(FString::Printf(TEXT("linear wall → gamma %.4f"), Gamma), FMath::IsNearlyEqual(Gamma, 1.0f, 0.01f));
     AddInfo(Report);
     TestTrue(TEXT("column R"), Near(R, TrueM.GetColumn(0), 1e-4));
     TestTrue(TEXT("column G"), Near(G, TrueM.GetColumn(1), 1e-4));
@@ -196,6 +198,69 @@ bool FLightSyncCalRoundTripTest::RunTest(const FString &Parameters)
     const double Error = (Camera - Wanted).Size() / Wanted.Size();
     TestTrue(FString::Printf(TEXT("camera error %.3f%% (8bit 量子化のみ)"), Error * 100.0), Error < 0.01);
     TestFalse(TEXT("in gamut"), Out.bOutOfGamut);
+    return true;
+}
+
+LS_CAL_TEST(FLightSyncCalWallCurveTest, "StageFitRecoversWallResponseCurve")
+bool FLightSyncCalWallCurveTest::RunTest(const FString &Parameters)
+{
+    // 壁の実際の応答が想定 (プローブのデコード) より 1.2 乗だけ強い場合: 真の光 = T^1.2
+    const double TrueGamma = 1.2;
+    const FMatrix3x3 TrueM = FMatrix3x3::FromColumns(FVector3d(0.80, 0.10, 0.02), FVector3d(0.15, 0.90, 0.08), FVector3d(0.03, 0.05, 0.85));
+    const FVector3d ProbeBlack(0.001, 0.001, 0.001);
+    const FVector3d CameraBlack(0.01, 0.012, 0.011);
+    auto Pow3 = [](const FVector3d &V, double G) { return FVector3d(FMath::Pow(V.X, G), FMath::Pow(V.Y, G), FMath::Pow(V.Z, G)); };
+
+    TArray<FLightSyncCalibrationStep> Steps = ULightSyncCalibrator::MakeWallSteps();
+    for (FLightSyncCalibrationStep &Step : Steps)
+    {
+        // プローブが測る値 (トーンカーブ後) は色・明るさで非線形でよい
+        const FVector3d T = FVector3d(FMath::Pow(Step.PatchColor.R * 0.7, 0.8), FMath::Pow(Step.PatchColor.G * 0.7, 0.8), FMath::Pow(Step.PatchColor.B * 0.7, 0.8)) + ProbeBlack;
+        Step.ProbeReference = ToColor(T);
+        Step.CameraCode = ToColor(TrueM.Transform(Pow3(T, TrueGamma) - Pow3(ProbeBlack, TrueGamma)) + CameraBlack);
+        Step.bMeasured = true;
+    }
+
+    FLinearColor R, G, B;
+    float Gamma = 0.0f;
+    FString Report;
+    TestTrue(TEXT("fit ok"), ULightSyncCalibrator::FitStageFromSteps(Steps, ELightSyncCameraTransfer::Linear, R, G, B, Gamma, Report));
+    AddInfo(Report);
+    TestTrue(FString::Printf(TEXT("gamma %.4f (1.2)"), Gamma), FMath::IsNearlyEqual(Gamma, 1.2f, 0.005f));
+    TestTrue(TEXT("column R"), Near(R, TrueM.GetColumn(0), 2e-3));
+    TestTrue(TEXT("column G"), Near(G, TrueM.GetColumn(1), 2e-3));
+    TestTrue(TEXT("column B"), Near(B, TrueM.GetColumn(2), 2e-3));
+
+    // 記録時に既に補正ガンマ 1.2 が掛かっていた (再キャリブレーション) 場合も、二重に掛けず 1.2 に戻る
+    for (FLightSyncCalibrationStep &Step : Steps)
+    {
+        const FVector3d T(Step.ProbeReference.R, Step.ProbeReference.G, Step.ProbeReference.B);
+        Step.ProbeReference = ToColor(Pow3(T, 1.2));
+        Step.ReferenceGammaAtRecord = 1.2f;
+    }
+    float Gamma2 = 0.0f;
+    ULightSyncCalibrator::FitStageFromSteps(Steps, ELightSyncCameraTransfer::Linear, R, G, B, Gamma2, Report);
+    TestTrue(FString::Printf(TEXT("recalibration gamma %.4f (1.2)"), Gamma2), FMath::IsNearlyEqual(Gamma2, 1.2f, 0.005f));
+    return true;
+}
+
+LS_CAL_TEST(FLightSyncCalWallSceneModeTest, "SceneModeWallCalibrationKeepsGammaOne")
+bool FLightSyncCalWallSceneModeTest::RunTest(const FString &Parameters)
+{
+    TArray<FLightSyncCalibrationStep> Steps = ULightSyncCalibrator::MakeWallSteps();
+    for (FLightSyncCalibrationStep &Step : Steps)
+    {
+        Step.ProbeReference = Step.PatchColor;
+        Step.CameraCode = FLinearColor(FMath::Pow(Step.PatchColor.R, 1.5f), FMath::Pow(Step.PatchColor.G, 1.5f), FMath::Pow(Step.PatchColor.B, 1.5f));
+        Step.bRecordedInWallMode = false;
+        Step.bMeasured = true;
+    }
+    FLinearColor R, G, B;
+    float Gamma = 0.0f;
+    FString Report;
+    ULightSyncCalibrator::FitStageFromSteps(Steps, ELightSyncCameraTransfer::Linear, R, G, B, Gamma, Report);
+    TestTrue(TEXT("gamma stays 1 in Scene mode"), Gamma == 1.0f);
+    TestTrue(TEXT("warns about Scene mode"), Report.Contains(TEXT("Scene")));
     return true;
 }
 

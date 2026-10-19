@@ -27,6 +27,7 @@ public class LightSyncDMXEditor : ModuleRules
             "WorkspaceMenuStructure",
             "LevelEditor",
             "PropertyEditor",
+            "EditorWidgets",
         });
     }
 }

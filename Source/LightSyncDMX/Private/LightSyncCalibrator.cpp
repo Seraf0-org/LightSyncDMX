@@ -126,6 +126,11 @@ TArray<FLightSyncCalibrationStep> ULightSyncCalibrator::MakeWallSteps()
     Add(TEXT("壁 緑"), FLinearColor(0.0f, 1.0f, 0.0f));
     Add(TEXT("壁 青"), FLinearColor(0.0f, 0.0f, 1.0f));
     Add(TEXT("壁 白"), FLinearColor(1.0f, 1.0f, 1.0f));
+    // 壁の応答カーブ用の灰色の段階 (エミッシブで 1/16 〜 1/2)
+    for (const float Level : {0.0625f, 0.125f, 0.25f, 0.5f})
+    {
+        Add(*FString::Printf(TEXT("壁 灰 %s%% (応答カーブ)"), *FString::SanitizeFloat(Level * 100.0f)), FLinearColor(Level, Level, Level));
+    }
     return Steps;
 }
 
@@ -368,6 +373,8 @@ bool ULightSyncCalibrator::RecordWallMeasurement(int32 Index, FLinearColor Camer
             return false;
         }
         Step.ProbeReference = Reference;
+        Step.ReferenceGammaAtRecord = (Probe->DMXOutput && Probe->DMXOutput->StageCalibration) ? Probe->DMXOutput->StageCalibration->ReferenceGamma : 1.0f;
+        Step.bRecordedInWallMode = Probe->ReferenceMode == ELightSyncReferenceMode::Wall;
     }
     else if (!Step.bMeasured)
     {
@@ -494,10 +501,32 @@ bool ULightSyncCalibrator::FitFixtureFromSteps(const FLightSyncFixtureProfileDat
     return true;
 }
 
+namespace
+{
+    /** 記録時の補正ガンマを外した基準値 (補正前の「表示特性でデコードしただけ」の値) */
+    FVector3d BaseReference(const FLightSyncCalibrationStep &Step)
+    {
+        const double InvGamma = 1.0 / FMath::Max(static_cast<double>(Step.ReferenceGammaAtRecord), 0.05);
+        auto Undo = [InvGamma](double V) { return FMath::Pow(FMath::Max(V, 0.0), InvGamma); };
+        return FVector3d(Undo(Step.ProbeReference.R), Undo(Step.ProbeReference.G), Undo(Step.ProbeReference.B));
+    }
+
+    FVector3d PowVec(const FVector3d &V, double Gamma)
+    {
+        return FVector3d(FMath::Pow(FMath::Max(V.X, 0.0), Gamma), FMath::Pow(FMath::Max(V.Y, 0.0), Gamma), FMath::Pow(FMath::Max(V.Z, 0.0), Gamma));
+    }
+
+    bool IsGray(const FLinearColor &C)
+    {
+        return !C.IsAlmostBlack() && FMath::IsNearlyEqual(C.R, C.G) && FMath::IsNearlyEqual(C.G, C.B);
+    }
+}
+
 bool ULightSyncCalibrator::FitStageFromSteps(const TArray<FLightSyncCalibrationStep> &Steps, ELightSyncCameraTransfer Transfer,
-                                            FLinearColor &OutRed, FLinearColor &OutGreen, FLinearColor &OutBlue, FString &OutReport)
+                                            FLinearColor &OutRed, FLinearColor &OutGreen, FLinearColor &OutBlue, float &OutGamma, FString &OutReport)
 {
     OutReport.Reset();
+    OutGamma = 1.0f;
 
     const FLightSyncCalibrationStep *Black = FindStep(Steps, [](const FLightSyncCalibrationStep &S)
                                                       { return S.Kind == ELightSyncCalibrationStepKind::WallPatch && S.PatchColor.IsAlmostBlack(); });
@@ -507,21 +536,95 @@ bool ULightSyncCalibrator::FitStageFromSteps(const TArray<FLightSyncCalibrationS
         return false;
     }
     const FVector3d CameraBlack = LinearizeCamera(Transfer, Black->CameraCode);
-    const FVector3d ReferenceBlack = ToVec(Black->ProbeReference);
+    const FVector3d ReferenceBlack = BaseReference(*Black);
 
+    bool bAnySceneMode = !Black->bRecordedInWallMode;
+    for (const FLightSyncCalibrationStep &Step : Steps)
+    {
+        bAnySceneMode |= Step.bMeasured && Step.Kind == ELightSyncCalibrationStepKind::WallPatch && !Step.bRecordedInWallMode;
+    }
+
+    // --- 壁の応答の補正ガンマ: 灰色パッチで camera_lum ≈ c·(T_lum^g − T_black_lum^g) ---
+    TArray<double> GrayT, GrayCamera;
+    for (const FLightSyncCalibrationStep &Step : Steps)
+    {
+        if (Step.bMeasured && Step.Kind == ELightSyncCalibrationStepKind::WallPatch && IsGray(Step.PatchColor))
+        {
+            GrayT.Add(Luminance(BaseReference(Step)));
+            GrayCamera.Add(Luminance(LinearizeCamera(Transfer, Step.CameraCode) - CameraBlack));
+        }
+    }
+
+    double Gamma = 1.0;
+    if (GrayT.Num() >= 3 && !bAnySceneMode)
+    {
+        const double BlackLum = Luminance(ReferenceBlack);
+        // 与えた g での最小二乗の相対残差 (c は解析的に最適化)
+        auto Residual = [&](double G)
+        {
+            double XY = 0.0, XX = 0.0, YY = 0.0;
+            for (int32 Index = 0; Index < GrayT.Num(); ++Index)
+            {
+                const double X = FMath::Pow(FMath::Max(GrayT[Index], 0.0), G) - FMath::Pow(FMath::Max(BlackLum, 0.0), G);
+                XY += X * GrayCamera[Index];
+                XX += X * X;
+                YY += GrayCamera[Index] * GrayCamera[Index];
+            }
+            if (XX <= 0.0 || YY <= 0.0)
+            {
+                return 1.0;
+            }
+            return FMath::Max(1.0 - (XY * XY) / (XX * YY), 0.0);   // 1 − cos² (スケールに依存しない)
+        };
+
+        // log g で黄金分割探索 (0.25 〜 4)
+        double Lo = FMath::Loge(0.25), Hi = FMath::Loge(4.0);
+        const double Phi = 0.5 * (FMath::Sqrt(5.0) - 1.0);
+        double A = Hi - Phi * (Hi - Lo), B = Lo + Phi * (Hi - Lo);
+        double FA = Residual(FMath::Exp(A)), FB = Residual(FMath::Exp(B));
+        for (int32 Iter = 0; Iter < 80; ++Iter)
+        {
+            if (FA < FB)
+            {
+                Hi = B; B = A; FB = FA;
+                A = Hi - Phi * (Hi - Lo);
+                FA = Residual(FMath::Exp(A));
+            }
+            else
+            {
+                Lo = A; A = B; FA = FB;
+                B = Lo + Phi * (Hi - Lo);
+                FB = Residual(FMath::Exp(B));
+            }
+        }
+        Gamma = FMath::Exp(0.5 * (Lo + Hi));
+        OutReport += FString::Printf(TEXT("壁の応答の補正ガンマ: %.3f (灰色 %d 段、当てはまりの残差 %.4f%%)\n"),
+                                     Gamma, GrayT.Num(), FMath::Sqrt(Residual(Gamma)) * 100.0);
+    }
+    else if (bAnySceneMode)
+    {
+        OutReport += TEXT("※ Scene モードで記録した測定があります。壁のキャリブレーションは Wall モードで行ってください (補正ガンマは 1 のまま)\n");
+    }
+    else
+    {
+        OutReport += TEXT("壁の応答カーブ: 灰色の段階が 3 つ未満なので補正しません\n");
+    }
+
+    // --- M_ref: 基準値を補正後 (T^g) にしてから当てはめる ---
+    const FVector3d ReferenceBlackCorrected = PowVec(ReferenceBlack, Gamma);
     TArray<FVector3d> Reference, Measured;
     for (const FLightSyncCalibrationStep &Step : Steps)
     {
         if (Step.bMeasured && Step.Kind == ELightSyncCalibrationStepKind::WallPatch && !Step.PatchColor.IsAlmostBlack())
         {
-            Reference.Add(ToVec(Step.ProbeReference) - ReferenceBlack);
+            Reference.Add(PowVec(BaseReference(Step), Gamma) - ReferenceBlackCorrected);
             Measured.Add(LinearizeCamera(Transfer, Step.CameraCode) - CameraBlack);
         }
     }
 
     if (Reference.Num() < 3)
     {
-        OutReport = TEXT("色パッチの測定が 3 つ以上必要です (赤・緑・青)");
+        OutReport += TEXT("色パッチの測定が 3 つ以上必要です (赤・緑・青)");
         return false;
     }
 
@@ -529,22 +632,23 @@ bool ULightSyncCalibrator::FitStageFromSteps(const TArray<FLightSyncCalibrationS
     double Rms = 0.0;
     if (!Fit3x3FromPatches(Reference, Measured, Matrix, &Rms))
     {
-        OutReport = TEXT("行列を求められませんでした (パッチの色が似すぎているか、プローブの基準値が 0)");
+        OutReport += TEXT("行列を求められませんでした (パッチの色が似すぎているか、プローブの基準値が 0)");
         return false;
     }
 
     OutRed = ToColor(Matrix.GetColumn(0));
     OutGreen = ToColor(Matrix.GetColumn(1));
     OutBlue = ToColor(Matrix.GetColumn(2));
+    OutGamma = static_cast<float>(Gamma);
 
     double Scale = 0.0;
     for (const FVector3d &M : Measured)
     {
         Scale = FMath::Max(Scale, M.Size());
     }
-    OutReport = FString::Printf(TEXT("M_ref 列: R (%.4f, %.4f, %.4f)  G (%.4f, %.4f, %.4f)  B (%.4f, %.4f, %.4f)\n残差 RMS: %.2f%% (最大測定値比)\n"),
-                                OutRed.R, OutRed.G, OutRed.B, OutGreen.R, OutGreen.G, OutGreen.B, OutBlue.R, OutBlue.G, OutBlue.B,
-                                Scale > 0.0 ? Rms / Scale * 100.0 : 0.0);
+    OutReport += FString::Printf(TEXT("M_ref 列: R (%.4f, %.4f, %.4f)  G (%.4f, %.4f, %.4f)  B (%.4f, %.4f, %.4f)\n残差 RMS: %.2f%% (最大測定値比)\n"),
+                                 OutRed.R, OutRed.G, OutRed.B, OutGreen.R, OutGreen.G, OutGreen.B, OutBlue.R, OutBlue.G, OutBlue.B,
+                                 Scale > 0.0 ? Rms / Scale * 100.0 : 0.0);
     return true;
 }
 
@@ -589,7 +693,8 @@ bool ULightSyncCalibrator::FitStage(ULightSyncStageCalibration *Target, FString 
     }
 
     FLinearColor Red, Green, Blue;
-    if (!FitStageFromSteps(WallSteps, CameraTransfer, Red, Green, Blue, OutReport))
+    float Gamma = 1.0f;
+    if (!FitStageFromSteps(WallSteps, CameraTransfer, Red, Green, Blue, Gamma, OutReport))
     {
         LastReport = OutReport;
         return false;
@@ -599,6 +704,7 @@ bool ULightSyncCalibrator::FitStage(ULightSyncStageCalibration *Target, FString 
     Target->ReferenceRed = Red;
     Target->ReferenceGreen = Green;
     Target->ReferenceBlue = Blue;
+    Target->ReferenceGamma = Gamma;
     Target->MarkPackageDirty();
     LastReport = OutReport;
     return true;

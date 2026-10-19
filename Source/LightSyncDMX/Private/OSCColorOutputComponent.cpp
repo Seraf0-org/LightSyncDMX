@@ -8,6 +8,7 @@
 #include "OSCBundle.h"
 #include "OSCManager.h"
 #include "HAL/PlatformTime.h"
+#include "LightSyncSettings.h"
 
 UOSCColorOutputComponent::UOSCColorOutputComponent()
 {
@@ -180,6 +181,12 @@ void UOSCColorOutputComponent::SendColorToTarget(const FLinearColor &Color, int3
 
 void UOSCColorOutputComponent::SendToTarget(int32 TargetIndex, const FLinearColor &Color)
 {
+    // nDisplay クラスタ等で、送信役でない PC からは送らない (二重送信の防止)
+    if (!LightSyncOutput::CanOutput(GetWorld()))
+    {
+        return;
+    }
+
     if (!OSCClients.IsValidIndex(TargetIndex) || !OSCClients[TargetIndex])
     {
         return;
@@ -215,8 +222,8 @@ void UOSCColorOutputComponent::ResolveTargetValues(const FOSCTargetConfig &Confi
     {
     case EOSCColorValue::FixtureLevels:
     {
-        const FLightSyncFixtureProfileData Profile = Config.Profile ? Config.Profile->Profile
-                                                                    : LightSyncFixture::MakePreset(ELightSyncColorMode::RGB);
+        const FLightSyncFixtureProfileData &Profile = Config.Profile ? Config.Profile->Profile
+                                                                     : LightSyncFixture::GetPreset(ELightSyncColorMode::RGB);
         const LightSyncColor::FMatrix3x3 RefToCamera = StageCalibration ? StageCalibration->GetReferenceToCamera()
                                                                         : LightSyncColor::FMatrix3x3::Identity();
         const FLightSyncFixtureOutput Output = LightSyncFixture::Compute(Profile, Target, RefToCamera, 1.0);
@@ -440,6 +447,10 @@ void UOSCColorOutputComponent::SendDasLightFormat(
 
 void UOSCColorOutputComponent::SendCustomOSCFloat(const FString &Address, float Value)
 {
+    if (!LightSyncOutput::CanOutput(GetWorld()))
+    {
+        return;
+    }
     EnsureClientsInitialized();
 
     for (int32 i = 0; i < OSCClients.Num(); ++i)
@@ -456,6 +467,10 @@ void UOSCColorOutputComponent::SendCustomOSCFloat(const FString &Address, float 
 
 void UOSCColorOutputComponent::SendCustomOSCInt(const FString &Address, int32 Value)
 {
+    if (!LightSyncOutput::CanOutput(GetWorld()))
+    {
+        return;
+    }
     EnsureClientsInitialized();
 
     for (int32 i = 0; i < OSCClients.Num(); ++i)

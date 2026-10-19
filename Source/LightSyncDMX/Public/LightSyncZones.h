@@ -128,6 +128,8 @@ namespace LightSyncZones
         float KeyRefineCos = 2.0f;
         /** キャプチャ値の伝達関数 */
         ELightSyncInputTransfer InputTransfer = ELightSyncInputTransfer::Linear;
+        /** デコード後に掛ける補正ガンマ (1 = なし) */
+        float TransferGamma = 1.0f;
     };
 
     /** 積分結果 (Zones と同じ並び) */

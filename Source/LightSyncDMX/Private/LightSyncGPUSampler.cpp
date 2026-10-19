@@ -19,9 +19,12 @@
 #include "ShaderParameterStruct.h"
 #include "ShaderCompilerCore.h"
 #include "DataDrivenShaderPlatformInfo.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+
+DECLARE_GPU_STAT_NAMED(LightSyncZones, TEXT("LightSync Zones"));
 
 // ============================================================
-// Compute Shader 宣言 (LightSyncAverageCS.usf の 2 エントリポイント)
+// Compute Shader 宣言 (LightSyncAverageCS.usf の 5 エントリポイント)
 // ============================================================
 
 BEGIN_SHADER_PARAMETER_STRUCT(FLightSyncZoneShaderParameters, )
@@ -29,55 +32,42 @@ BEGIN_SHADER_PARAMETER_STRUCT(FLightSyncZoneShaderParameters, )
     SHADER_PARAMETER_SAMPLER(SamplerState, InputSampler)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVector4f>, OutputBuffer)
     SHADER_PARAMETER(uint32, TextureSize)
-    SHADER_PARAMETER(uint32, FaceIndex)
+    SHADER_PARAMETER(uint32, GroupsPerSide)
     SHADER_PARAMETER(uint32, NumZones)
     SHADER_PARAMETER(float, PartitionSharpness)
     SHADER_PARAMETER(FVector3f, LuminanceCoeffs)
     SHADER_PARAMETER(float, KeyRefineCos)
     SHADER_PARAMETER(uint32, InputTransfer)
+    SHADER_PARAMETER(float, TransferGamma)
     SHADER_PARAMETER_ARRAY(FVector4f, ZoneDirShape, [LightSyncZones::MaxZones])
     SHADER_PARAMETER_ARRAY(FVector4f, ZoneParams, [LightSyncZones::MaxZones])
 END_SHADER_PARAMETER_STRUCT()
 
-class FLightSyncPeakCS : public FGlobalShader
-{
-    DECLARE_GLOBAL_SHADER(FLightSyncPeakCS);
-    SHADER_USE_PARAMETER_STRUCT(FLightSyncPeakCS, FGlobalShader);
-    using FParameters = FLightSyncZoneShaderParameters;
+#define LIGHTSYNC_DECLARE_ZONE_CS(ClassName)                                                         \
+    class ClassName : public FGlobalShader                                                           \
+    {                                                                                                \
+        DECLARE_GLOBAL_SHADER(ClassName);                                                            \
+        SHADER_USE_PARAMETER_STRUCT(ClassName, FGlobalShader);                                       \
+        using FParameters = FLightSyncZoneShaderParameters;                                          \
+                                                                                                     \
+        static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)   \
+        {                                                                                            \
+            return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);              \
+        }                                                                                            \
+    };
 
-    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-    {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-    }
-};
-
-class FLightSyncRefineCS : public FGlobalShader
-{
-    DECLARE_GLOBAL_SHADER(FLightSyncRefineCS);
-    SHADER_USE_PARAMETER_STRUCT(FLightSyncRefineCS, FGlobalShader);
-    using FParameters = FLightSyncZoneShaderParameters;
-
-    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-    {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-    }
-};
-
-class FLightSyncZonesCS : public FGlobalShader
-{
-    DECLARE_GLOBAL_SHADER(FLightSyncZonesCS);
-    SHADER_USE_PARAMETER_STRUCT(FLightSyncZonesCS, FGlobalShader);
-    using FParameters = FLightSyncZoneShaderParameters;
-
-    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-    {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-    }
-};
+LIGHTSYNC_DECLARE_ZONE_CS(FLightSyncPeakCS)
+LIGHTSYNC_DECLARE_ZONE_CS(FLightSyncRefineCS)
+LIGHTSYNC_DECLARE_ZONE_CS(FLightSyncRefineReduceCS)
+LIGHTSYNC_DECLARE_ZONE_CS(FLightSyncZonesCS)
+LIGHTSYNC_DECLARE_ZONE_CS(FLightSyncZonesReduceCS)
+#undef LIGHTSYNC_DECLARE_ZONE_CS
 
 IMPLEMENT_GLOBAL_SHADER(FLightSyncPeakCS, "/LightSyncDMX/Private/LightSyncAverageCS.usf", "MainPeakCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FLightSyncRefineCS, "/LightSyncDMX/Private/LightSyncAverageCS.usf", "MainRefineCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FLightSyncRefineReduceCS, "/LightSyncDMX/Private/LightSyncAverageCS.usf", "MainRefineReduceCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FLightSyncZonesCS, "/LightSyncDMX/Private/LightSyncAverageCS.usf", "MainZonesCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FLightSyncZonesReduceCS, "/LightSyncDMX/Private/LightSyncAverageCS.usf", "MainZonesReduceCS", SF_Compute);
 
 // ============================================================
 // ヘルパー
@@ -85,7 +75,7 @@ IMPLEMENT_GLOBAL_SHADER(FLightSyncZonesCS, "/LightSyncDMX/Private/LightSyncAvera
 
 namespace
 {
-    /** 出力バッファ → ゾーン結果 (6 面を合計) */
+    /** 出力バッファの先頭 (ReadbackElements 個) → ゾーン結果 */
     LightSyncZones::FResult DecodeOutput(const FVector4f* Data, int32 NumZones)
     {
         LightSyncZones::FResult Result;
@@ -99,23 +89,14 @@ namespace
                 Peak = Data[Face];
             }
         }
-        FVector4f Refine(0.0f, 0.0f, 0.0f, 0.0f);
-        for (int32 Face = 0; Face < 6; ++Face)
-        {
-            Refine += Data[FLightSyncGPUSampler::RefineBase + Face];
-        }
+        const FVector4f Refine = Data[FLightSyncGPUSampler::RefineTotal];
         const FVector3f RefineDir(Refine.X, Refine.Y, Refine.Z);
         Result.KeyDirection = (Refine.W > 0.0f && !RefineDir.IsNearlyZero()) ? RefineDir.GetSafeNormal() : FVector3f(Peak.X, Peak.Y, Peak.Z);
         Result.KeyLuminance = FMath::Max(Peak.W, 0.0f);
 
         for (int32 Zone = 0; Zone < NumZones; ++Zone)
         {
-            FVector4f Sum(0.0f, 0.0f, 0.0f, 0.0f);
-            for (int32 Face = 0; Face < 6; ++Face)
-            {
-                Sum += Data[FLightSyncGPUSampler::ZonesBase + Face * LightSyncZones::MaxZones + Zone];
-            }
-            Result.Zones[Zone] = Sum;
+            Result.Zones[Zone] = Data[FLightSyncGPUSampler::ZonesTotal + Zone];
         }
         return Result;
     }
@@ -127,6 +108,7 @@ namespace
         P.LuminanceCoeffs = Setup.LuminanceCoeffs;
         P.KeyRefineCos = Setup.KeyRefineCos;
         P.InputTransfer = static_cast<uint32>(Setup.InputTransfer);
+        P.TransferGamma = Setup.TransferGamma;
 
         for (int32 Index = 0; Index < LightSyncZones::MaxZones; ++Index)
         {
@@ -228,6 +210,7 @@ void FLightSyncGPUSampler::Release()
 
 void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(LightSync_DispatchSampling);
     if (!bInitialized || !CubeRT)
     {
         return;
@@ -239,46 +222,10 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
         return;
     }
 
-    // --- 進行中のリードバックをレンダースレッドでポーリングする ---
-    // IsReady/Lock/Unlock は必ずレンダースレッドから呼ぶ。
+    // 前回のコピーが未取得の間は同じ ReadbackBuffer に新しいコピーを積まない
     if (bDispatched)
     {
-        TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> SharedState = ReadbackState;
-        TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackPtr = ReadbackBuffer;
-        if (!SharedState.IsValid() || !ReadbackPtr.IsValid())
-        {
-            return;
-        }
-
-        bool bNeedsPoll = false;
-        {
-            FScopeLock Lock(&SharedState->Lock);
-            bNeedsPoll = !SharedState->bDataReady;
-        }
-
-        if (bNeedsPoll)
-        {
-            const int32 NumZones = InFlightNumZones;
-            ENQUEUE_RENDER_COMMAND(LightSyncPollReadback)(
-                [ReadbackPtr, SharedState, NumZones](FRHICommandListImmediate& /*RHICmdList*/)
-                {
-                    if (ReadbackPtr->IsReady())
-                    {
-                        const FVector4f* Src = static_cast<const FVector4f*>(
-                            ReadbackPtr->Lock(NumOutputElements * sizeof(FVector4f)));
-                        if (Src)
-                        {
-                            FScopeLock Lock(&SharedState->Lock);
-                            FMemory::Memcpy(SharedState->RawData, Src, NumOutputElements * sizeof(FVector4f));
-                            SharedState->NumZones = NumZones;
-                            SharedState->bDataReady = true;
-                        }
-                        ReadbackPtr->Unlock();
-                    }
-                });
-        }
-
-        // 前回のコピーが未取得の間は同じ ReadbackBuffer に新しいコピーを積まない
+        Poll();
         return;
     }
 
@@ -303,59 +250,114 @@ void FLightSyncGPUSampler::DispatchSampling(UTextureRenderTargetCube* CubeRT)
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             TShaderMapRef<FLightSyncPeakCS> PeakCS(ShaderMap);
             TShaderMapRef<FLightSyncRefineCS> RefineCS(ShaderMap);
+            TShaderMapRef<FLightSyncRefineReduceCS> RefineReduceCS(ShaderMap);
             TShaderMapRef<FLightSyncZonesCS> ZonesCS(ShaderMap);
-            if (!PeakCS.IsValid() || !RefineCS.IsValid() || !ZonesCS.IsValid())
+            TShaderMapRef<FLightSyncZonesReduceCS> ZonesReduceCS(ShaderMap);
+            if (!PeakCS.IsValid() || !RefineCS.IsValid() || !RefineReduceCS.IsValid() || !ZonesCS.IsValid() || !ZonesReduceCS.IsValid())
             {
                 return;
             }
+            const int32 GroupsPerSide = GetGroupsPerSide(static_cast<int32>(TexSize));
 
             FRDGBuilder GraphBuilder(RHICmdList);
-
-            FRDGTextureRef CubeTex = GraphBuilder.RegisterExternalTexture(
-                CreateRenderTarget(CubeTextureRHI, TEXT("LS_CubeRT")));
-            FRDGTextureSRVRef CubeSRV = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(CubeTex));
-
-            FRDGBufferRef OutputBuf = GraphBuilder.CreateBuffer(
-                FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), NumOutputElements),
-                TEXT("LS_ZoneOutput"));
-            FRDGBufferUAVRef OutputUAV = GraphBuilder.CreateUAV(OutputBuf);
-
-            auto MakeParams = [&](uint32 FaceIdx)
             {
-                FLightSyncZoneShaderParameters* P = GraphBuilder.AllocParameters<FLightSyncZoneShaderParameters>();
-                P->InputCube    = CubeSRV;
-                P->InputSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-                P->OutputBuffer = OutputUAV;
-                P->TextureSize  = TexSize;
-                P->FaceIndex    = FaceIdx;
-                FillShaderParameters(*P, CapturedSetup);
-                return P;
-            };
+                // GPU 統計のスコープは Execute() の前に閉じる (開いたままだと RDG のブレッドクラムが壊れる)
+                RDG_EVENT_SCOPE_STAT(GraphBuilder, LightSyncZones, "LightSync Zones");
+                RDG_GPU_STAT_SCOPE(GraphBuilder, LightSyncZones);
 
-            // Pass 1: 面ごとのピーク (Key ゾーン用)
-            for (uint32 FaceIdx = 0; FaceIdx < 6; ++FaceIdx)
-            {
-                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Peak%u", FaceIdx),
-                                             ERDGPassFlags::Compute, PeakCS, MakeParams(FaceIdx), FIntVector(1, 1, 1));
+                FRDGTextureRef CubeTex = GraphBuilder.RegisterExternalTexture(
+                    CreateRenderTarget(CubeTextureRHI, TEXT("LS_CubeRT")));
+                FRDGTextureSRVRef CubeSRV = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(CubeTex));
+
+                FRDGBufferRef OutputBuf = GraphBuilder.CreateBuffer(
+                    FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), NumOutputElements),
+                    TEXT("LS_ZoneOutput"));
+                FRDGBufferUAVRef OutputUAV = GraphBuilder.CreateUAV(OutputBuf);
+
+                auto MakeParams = [&]()
+                {
+                    FLightSyncZoneShaderParameters* P = GraphBuilder.AllocParameters<FLightSyncZoneShaderParameters>();
+                    P->InputCube     = CubeSRV;
+                    P->InputSampler  = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+                    P->OutputBuffer  = OutputUAV;
+                    P->TextureSize   = TexSize;
+                    P->GroupsPerSide = static_cast<uint32>(GroupsPerSide);
+                    FillShaderParameters(*P, CapturedSetup);
+                    return P;
+                };
+
+                // 各パスは前のパスの結果を同じバッファから読む (RDG がパス間に UAV バリアを入れる)
+                const FIntVector PerFace(1, 1, 6);
+                const FIntVector Grid(GroupsPerSide, GroupsPerSide, 6);
+                const FIntVector Single(1, 1, 1);
+
+                // Pass 1: 面ごとのピーク (Key ゾーン用)
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Peak"), ERDGPassFlags::Compute,
+                                             PeakCS, MakeParams(), PerFace);
+
+                // Pass 2: Key 方向の精密化
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Refine"), ERDGPassFlags::Compute,
+                                             RefineCS, MakeParams(), Grid);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_RefineReduce"), ERDGPassFlags::Compute,
+                                             RefineReduceCS, MakeParams(), Single);
+
+                // Pass 3: ゾーン積分
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Zones %dx%dx6", GroupsPerSide, GroupsPerSide),
+                                             ERDGPassFlags::Compute, ZonesCS, MakeParams(), Grid);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_ZonesReduce"), ERDGPassFlags::Compute,
+                                             ZonesReduceCS, MakeParams(), Single);
+
+                // CPU に読み戻すのは先頭の合計だけ
+                AddEnqueueCopyPass(GraphBuilder, ReadbackPtr.Get(), OutputBuf, ReadbackElements * sizeof(FVector4f));
             }
-
-            // Pass 2: Key 方向の精密化 (Pass 1 の結果を同じバッファから読む。RDG が UAV バリアを入れる)
-            for (uint32 FaceIdx = 0; FaceIdx < 6; ++FaceIdx)
-            {
-                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Refine%u", FaceIdx),
-                                             ERDGPassFlags::Compute, RefineCS, MakeParams(FaceIdx), FIntVector(1, 1, 1));
-            }
-
-            // Pass 3: ゾーン積分
-            for (uint32 FaceIdx = 0; FaceIdx < 6; ++FaceIdx)
-            {
-                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LightSync_Zones%u", FaceIdx),
-                                             ERDGPassFlags::Compute, ZonesCS, MakeParams(FaceIdx), FIntVector(1, 1, 1));
-            }
-
-            AddEnqueueCopyPass(GraphBuilder, ReadbackPtr.Get(), OutputBuf, NumOutputElements * sizeof(FVector4f));
 
             GraphBuilder.Execute();
+        });
+}
+
+// ============================================================
+// Poll
+// ============================================================
+
+void FLightSyncGPUSampler::Poll()
+{
+    if (!bInitialized || !bDispatched || ShouldUseCPUPath())
+    {
+        return;
+    }
+
+    TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> SharedState = ReadbackState;
+    TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> ReadbackPtr = ReadbackBuffer;
+    if (!SharedState.IsValid() || !ReadbackPtr.IsValid())
+    {
+        return;
+    }
+
+    {
+        FScopeLock Lock(&SharedState->Lock);
+        if (SharedState->bDataReady)
+        {
+            return;
+        }
+    }
+
+    // IsReady/Lock/Unlock は必ずレンダースレッドから呼ぶ
+    const int32 NumZones = InFlightNumZones;
+    ENQUEUE_RENDER_COMMAND(LightSyncPollReadback)(
+        [ReadbackPtr, SharedState, NumZones](FRHICommandListImmediate& /*RHICmdList*/)
+        {
+            if (ReadbackPtr->IsReady())
+            {
+                const FVector4f* Src = static_cast<const FVector4f*>(ReadbackPtr->Lock(ReadbackElements * sizeof(FVector4f)));
+                if (Src)
+                {
+                    FScopeLock Lock(&SharedState->Lock);
+                    FMemory::Memcpy(SharedState->RawData, Src, ReadbackElements * sizeof(FVector4f));
+                    SharedState->NumZones = NumZones;
+                    SharedState->bDataReady = true;
+                }
+                ReadbackPtr->Unlock();
+            }
         });
 }
 

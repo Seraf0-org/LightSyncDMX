@@ -21,6 +21,7 @@
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
+#include "SEnumCombo.h"
 #include "Widgets/Colors/SColorBlock.h"
 #include "Styling/AppStyle.h"
 #include "Editor.h"
@@ -30,20 +31,8 @@
 #define LOCTEXT_NAMESPACE "SLightSyncMonitor"
 
 // ============================================================
-// カラーモード / OSCフォーマット名 (表示用)
+// ヘルパー
 // ============================================================
-
-static const TCHAR* ColorModeNames[] = {
-    TEXT("RGB (3ch)"),
-    TEXT("RGBW (4ch)"),
-    TEXT("RGBAW (5ch)"),
-    TEXT("Dimmer+RGB (4ch)"),
-    TEXT("CCT+Brightness (2ch)"),
-    TEXT("CCT & RGBW (10ch)")
-};
-static constexpr int32 NumColorModes = UE_ARRAY_COUNT(ColorModeNames);
-// ELightSyncColorMode に値を追加したら ColorModeNames も同時に更新すること
-static_assert(NumColorModes == 6, "ColorModeNames と ELightSyncColorMode の要素数が一致していません");
 
 // 正規化照度 (1.0 を超えうる) を色見本用に縮める。色相は保つ
 static FLinearColor ToDisplayColor(const FLinearColor& C)
@@ -63,17 +52,6 @@ static void MarkProbeDirty(const TWeakObjectPtr<ALightProbeActor>& W)
     }
 }
 
-static const TCHAR* OSCFormatNames[] = {
-    TEXT("Float RGB"),
-    TEXT("Int RGB (0-255)"),
-    TEXT("Float RGBA"),
-    TEXT("QLC+ 互換"),
-    TEXT("DasLight 互換"),
-    TEXT("カスタム")
-};
-static constexpr int32 NumOSCFormats = UE_ARRAY_COUNT(OSCFormatNames);
-// EOSCMessageFormat に値を追加したら OSCFormatNames も同時に更新すること
-static_assert(NumOSCFormats == 6, "OSCFormatNames と EOSCMessageFormat の要素数が一致していません");
 
 // ============================================================
 // Construct
@@ -88,8 +66,19 @@ SLightSyncMonitorWidget::~SLightSyncMonitorWidget()
     }
 }
 
+TWeakPtr<SLightSyncMonitorWidget> SLightSyncMonitorWidget::LastInstance;
+
+void SLightSyncMonitorWidget::SetSettingsScrollOffset(float Offset)
+{
+    if (SettingsScrollBox.IsValid())
+    {
+        SettingsScrollBox->SetScrollOffset(Offset);
+    }
+}
+
 void SLightSyncMonitorWidget::Construct(const FArguments& InArgs)
 {
+    LastInstance = SharedThis(this);
     SAssignNew(SettingsPanelBox, SVerticalBox);
 
     ChildSlot
@@ -124,7 +113,7 @@ void SLightSyncMonitorWidget::Construct(const FArguments& InArgs)
                     .Orientation(Orient_Vertical)
 
                 + SSplitter::Slot()
-                    .Value(0.35f)
+                    .Value(0.18f)
                     [
                         SNew(SScrollBox)
                         + SScrollBox::Slot()
@@ -132,9 +121,9 @@ void SLightSyncMonitorWidget::Construct(const FArguments& InArgs)
                     ]
 
                 + SSplitter::Slot()
-                    .Value(0.65f)
+                    .Value(0.82f)
                     [
-                        SNew(SScrollBox)
+                        SAssignNew(SettingsScrollBox, SScrollBox)
                         + SScrollBox::Slot()
                             [SettingsPanelBox.ToSharedRef()]
                     ]
@@ -547,26 +536,10 @@ void SLightSyncMonitorWidget::BuildReferenceSection(ALightProbeActor* Probe)
 
     AddSectionHeader(LOCTEXT("SecReference", "色の基準"));
 
-    static const TCHAR* ReferenceModeNames[] = {
-        TEXT("LEDウォール表示色 (ディスプレイ基準)"),
-        TEXT("シーンの光 (シーン基準)"),
-    };
     AddLabeledRow(LOCTEXT("RefMode", "基準モード"),
-        SNew(SHorizontalBox)
-        + SHorizontalBox::Slot().FillWidth(0.3f)
-            [SNew(SSpinBox<int32>)
-                .MinValue(0).MaxValue(1).Delta(1)
-                .Value_Lambda([W]() { return W.IsValid() ? static_cast<int32>(W->ReferenceMode) : 0; })
-                .OnValueChanged_Lambda([W](int32 V) {
-                    MarkProbeDirty(W);
-                    if (W.IsValid()) W->ReferenceMode = static_cast<ELightSyncReferenceMode>(FMath::Clamp(V, 0, 1));
-                })]
-        + SHorizontalBox::Slot().FillWidth(0.7f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
-            [SNew(STextBlock)
-                .Text_Lambda([W]() -> FText {
-                    const int32 Idx = W.IsValid() ? FMath::Clamp(static_cast<int32>(W->ReferenceMode), 0, 1) : 0;
-                    return FText::FromString(ReferenceModeNames[Idx]);
-                })]);
+        SNew(SEnumComboBox, StaticEnum<ELightSyncReferenceMode>())
+            .CurrentValue_Lambda([W]() -> int32 { return W.IsValid() ? static_cast<int32>(W->ReferenceMode) : 0; })
+            .OnEnumSelectionChanged_Lambda([W](int32 V, ESelectInfo::Type) { MarkProbeDirty(W); if (W.IsValid()) W->ReferenceMode = static_cast<ELightSyncReferenceMode>(V); }));
 
     AddLabeledRow(LOCTEXT("RefCamera", "参照カメラ"),
         SNew(STextBlock)
@@ -576,26 +549,10 @@ void SLightSyncMonitorWidget::BuildReferenceSection(ALightProbeActor* Probe)
                 return LOCTEXT("NoRefCamera", "なし (手動露出を使用。Details パネルで設定)");
             }));
 
-    static const TCHAR* PostProcessSourceNames[] = {
-        TEXT("参照カメラ / 手動露出"),
-        TEXT("nDisplay 外側ビューポート"),
-    };
     AddLabeledRow(LOCTEXT("PPSource", "ポストプロセスの取得元"),
-        SNew(SHorizontalBox)
-        + SHorizontalBox::Slot().FillWidth(0.3f)
-            [SNew(SSpinBox<int32>)
-                .MinValue(0).MaxValue(1).Delta(1)
-                .Value_Lambda([W]() { return W.IsValid() ? static_cast<int32>(W->PostProcessSource) : 0; })
-                .OnValueChanged_Lambda([W](int32 V) {
-                    MarkProbeDirty(W);
-                    if (W.IsValid()) W->PostProcessSource = static_cast<ELightSyncPostProcessSource>(FMath::Clamp(V, 0, 1));
-                })]
-        + SHorizontalBox::Slot().FillWidth(0.7f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
-            [SNew(STextBlock)
-                .Text_Lambda([W]() -> FText {
-                    const int32 Idx = W.IsValid() ? FMath::Clamp(static_cast<int32>(W->PostProcessSource), 0, 1) : 0;
-                    return FText::FromString(PostProcessSourceNames[Idx]);
-                })]);
+        SNew(SEnumComboBox, StaticEnum<ELightSyncPostProcessSource>())
+            .CurrentValue_Lambda([W]() -> int32 { return W.IsValid() ? static_cast<int32>(W->PostProcessSource) : 0; })
+            .OnEnumSelectionChanged_Lambda([W](int32 V, ESelectInfo::Type) { MarkProbeDirty(W); if (W.IsValid()) W->PostProcessSource = static_cast<ELightSyncPostProcessSource>(V); }));
 
     AddLabeledRow(LOCTEXT("NDisplayViewport", "nDisplay ビューポート ID"),
         SNew(SEditableTextBox)
@@ -691,6 +648,56 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
     TWeakObjectPtr<ALightProbeActor> W(Probe);
 
     AddSectionHeader(LOCTEXT("SecDMX", "DMX出力設定"));
+    TSharedRef<int32> Fix = DMXFixtureIndex;
+
+    // --- フィクスチャの選択と追加 / 削除 ---
+    {
+        const int32 Num = Probe->DMXOutput ? Probe->DMXOutput->FixtureMappings.Num() : 0;
+        *Fix = FMath::Clamp(*Fix, 0, FMath::Max(Num - 1, 0));
+        AddLabeledRow(LOCTEXT("DMXFixSelect", "フィクスチャ"),
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(0.3f)
+                [SNew(SSpinBox<int32>)
+                    .MinValue(0).MaxValue(FMath::Max(Num - 1, 0)).Delta(1)
+                    .Value_Lambda([Fix]() { return *Fix; })
+                    .OnValueChanged_Lambda([Fix](int32 V) { *Fix = V; })]
+            + SHorizontalBox::Slot().FillWidth(0.4f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
+                [SNew(STextBlock)
+                    .Text_Lambda([W, Fix]() -> FText {
+                        if (!W.IsValid() || !W->DMXOutput || !W->DMXOutput->FixtureMappings.IsValidIndex(*Fix)) return LOCTEXT("DMXFixNone", "(なし)");
+                        return FText::FromString(FString::Printf(TEXT("%d / %d  %s"), *Fix + 1, W->DMXOutput->FixtureMappings.Num(),
+                            *W->DMXOutput->FixtureMappings[*Fix].FixtureName));
+                    })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+                [SNew(SButton)
+                    .Text(LOCTEXT("DMXFixAdd", "追加"))
+                    .OnClicked_Lambda([this, W, Fix]() {
+                        if (W.IsValid() && W->DMXOutput)
+                        {
+                            MarkProbeDirty(W);
+                            W->DMXOutput->Modify();
+                            W->DMXOutput->FixtureMappings.Add(FDMXFixtureMapping());
+                            *Fix = W->DMXOutput->FixtureMappings.Num() - 1;
+                            RefreshSettingsPanel();
+                        }
+                        return FReply::Handled();
+                    })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+                [SNew(SButton)
+                    .Text(LOCTEXT("DMXFixRemove", "削除"))
+                    .IsEnabled_Lambda([W, Fix]() { return W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix); })
+                    .OnClicked_Lambda([this, W, Fix]() {
+                        if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                        {
+                            MarkProbeDirty(W);
+                            W->DMXOutput->Modify();
+                            W->DMXOutput->FixtureMappings.RemoveAt(*Fix);
+                            *Fix = FMath::Max(*Fix - 1, 0);
+                            RefreshSettingsPanel();
+                        }
+                        return FReply::Handled();
+                    })]);
+    }
 
     if (!Probe->DMXOutput || Probe->DMXOutput->FixtureMappings.Num() == 0)
     {
@@ -704,110 +711,87 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
     // DMX出力有効
     AddLabeledRow(LOCTEXT("DMXEnabled", "DMX有効"),
         SNew(SCheckBox)
-            .IsChecked_Lambda([W]() -> ECheckBoxState {
+            .IsChecked_Lambda([W, Fix]() -> ECheckBoxState {
                 return (W.IsValid() && W->DMXOutput && W->DMXOutput->bDMXOutputEnabled)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
-            .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+            .OnCheckStateChanged_Lambda([W, Fix](ECheckBoxState S) {
                 MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput)
                     W->DMXOutput->bDMXOutputEnabled = (S == ECheckBoxState::Checked);
             }));
 
-    // ゾーン (フィクスチャ 1 個目)
+    // ゾーン
     AddLabeledRow(LOCTEXT("DMXZone", "ゾーン"),
         SNew(SEditableTextBox)
-            .Text_Lambda([W]() -> FText {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return FText::FromName(W->DMXOutput->FixtureMappings[0].Zone);
+            .Text_Lambda([W, Fix]() -> FText {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    return FText::FromName(W->DMXOutput->FixtureMappings[*Fix].Zone);
                 return FText::GetEmpty();
             })
-            .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+            .OnTextCommitted_Lambda([W, Fix](const FText& T, ETextCommit::Type) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].Zone = FName(*T.ToString());
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    W->DMXOutput->FixtureMappings[*Fix].Zone = FName(*T.ToString());
             }));
 
     // フィクスチャ名
     AddLabeledRow(LOCTEXT("FixtureName", "フィクスチャ名"),
         SNew(SEditableTextBox)
-            .Text_Lambda([W]() -> FText {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return FText::FromString(W->DMXOutput->FixtureMappings[0].FixtureName);
+            .Text_Lambda([W, Fix]() -> FText {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    return FText::FromString(W->DMXOutput->FixtureMappings[*Fix].FixtureName);
                 return FText::GetEmpty();
             })
-            .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+            .OnTextCommitted_Lambda([W, Fix](const FText& T, ETextCommit::Type) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].FixtureName = T.ToString();
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    W->DMXOutput->FixtureMappings[*Fix].FixtureName = T.ToString();
             }));
 
     // Universe
     AddLabeledRow(LOCTEXT("Universe", "Universe"),
         SNew(SSpinBox<int32>)
             .MinValue(1).MaxValue(64000).Delta(1)
-            .Value_Lambda([W]() -> int32 {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return W->DMXOutput->FixtureMappings[0].Universe;
+            .Value_Lambda([W, Fix]() -> int32 {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    return W->DMXOutput->FixtureMappings[*Fix].Universe;
                 return 1;
             })
-            .OnValueChanged_Lambda([W](int32 V) {
+            .OnValueChanged_Lambda([W, Fix](int32 V) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].Universe = V;
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    W->DMXOutput->FixtureMappings[*Fix].Universe = V;
             }));
 
     // 開始チャンネル
     AddLabeledRow(LOCTEXT("StartCh", "開始チャンネル"),
         SNew(SSpinBox<int32>)
             .MinValue(1).MaxValue(512).Delta(1)
-            .Value_Lambda([W]() -> int32 {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return W->DMXOutput->FixtureMappings[0].StartChannel;
+            .Value_Lambda([W, Fix]() -> int32 {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    return W->DMXOutput->FixtureMappings[*Fix].StartChannel;
                 return 1;
             })
-            .OnValueChanged_Lambda([W](int32 V) {
+            .OnValueChanged_Lambda([W, Fix](int32 V) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].StartChannel = V;
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    W->DMXOutput->FixtureMappings[*Fix].StartChannel = V;
             }));
 
     // カラーモード (スピンボックス + ラベル)
-    AddLabeledRow(LOCTEXT("ColorMode", "カラーモード"),
-        SNew(SHorizontalBox)
-        + SHorizontalBox::Slot().FillWidth(0.4f)
-            [SNew(SSpinBox<int32>)
-                .MinValue(0).MaxValue(NumColorModes - 1).Delta(1)
-                .Value_Lambda([W]() -> int32 {
-                    if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                        return static_cast<int32>(W->DMXOutput->FixtureMappings[0].ColorMode);
-                    return 0;
-                })
-                .OnValueChanged_Lambda([W](int32 V) {
-                    MarkProbeDirty(W);
-                    if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                        W->DMXOutput->FixtureMappings[0].ColorMode = static_cast<ELightSyncColorMode>(V);
-                })]
-        + SHorizontalBox::Slot().FillWidth(0.6f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
-            [SNew(STextBlock)
-                .Text_Lambda([W]() -> FText {
-                    if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    {
-                        int32 Idx = FMath::Clamp(
-                            static_cast<int32>(W->DMXOutput->FixtureMappings[0].ColorMode),
-                            0, NumColorModes - 1);
-                        return FText::FromString(ColorModeNames[Idx]);
-                    }
-                    return FText::GetEmpty();
-                })]);
+    AddLabeledRow(LOCTEXT("ColorMode", "プリセット (プロファイル未設定時)"),
+        SNew(SEnumComboBox, StaticEnum<ELightSyncColorMode>())
+            .CurrentValue_Lambda([W, Fix]() -> int32 { return (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix)) ? static_cast<int32>(W->DMXOutput->FixtureMappings[*Fix].ColorMode) : 0; })
+            .OnEnumSelectionChanged_Lambda([W, Fix](int32 V, ESelectInfo::Type) { MarkProbeDirty(W); if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix)) W->DMXOutput->FixtureMappings[*Fix].ColorMode = static_cast<ELightSyncColorMode>(V); }));
 
     // 使用チャンネル範囲 (512ch を超える場合は赤で警告)
     AddLabeledRow(LOCTEXT("ChannelRange", "使用チャンネル"),
         SNew(STextBlock)
-            .Text_Lambda([W]() -> FText {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+            .Text_Lambda([W, Fix]() -> FText {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
                 {
-                    const FDMXFixtureMapping& M = W->DMXOutput->FixtureMappings[0];
+                    const FDMXFixtureMapping& M = W->DMXOutput->FixtureMappings[*Fix];
                     const int32 EndCh = M.StartChannel + UDMXColorOutputComponent::GetMappingChannelCount(M) - 1;
                     return FText::FromString(UDMXColorOutputComponent::IsMappingInRange(M)
                         ? FString::Printf(TEXT("Ch %d - %d"), M.StartChannel, EndCh)
@@ -815,9 +799,9 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 }
                 return FText::GetEmpty();
             })
-            .ColorAndOpacity_Lambda([W]() -> FSlateColor {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0
-                    && !UDMXColorOutputComponent::IsMappingInRange(W->DMXOutput->FixtureMappings[0]))
+            .ColorAndOpacity_Lambda([W, Fix]() -> FSlateColor {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix)
+                    && !UDMXColorOutputComponent::IsMappingInRange(W->DMXOutput->FixtureMappings[*Fix]))
                 {
                     return FSlateColor(FLinearColor(1.0f, 0.3f, 0.3f));
                 }
@@ -828,24 +812,24 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
     AddLabeledRow(LOCTEXT("BrightScale", "強さのゲイン"),
         SNew(SSpinBox<float>)
             .MinValue(0.0f).MaxValue(100.0f).Delta(0.05f)
-            .Value_Lambda([W]() -> float {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    return W->DMXOutput->FixtureMappings[0].BrightnessScale;
+            .Value_Lambda([W, Fix]() -> float {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    return W->DMXOutput->FixtureMappings[*Fix].BrightnessScale;
                 return 1.0f;
             })
-            .OnValueChanged_Lambda([W](float V) {
+            .OnValueChanged_Lambda([W, Fix](float V) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
-                    W->DMXOutput->FixtureMappings[0].BrightnessScale = V;
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
+                    W->DMXOutput->FixtureMappings[*Fix].BrightnessScale = V;
             }));
 
     // プロファイル
     AddLabeledRow(LOCTEXT("DMXProfile", "灯体プロファイル"),
         SNew(STextBlock)
-            .Text_Lambda([W]() -> FText {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+            .Text_Lambda([W, Fix]() -> FText {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.IsValidIndex(*Fix))
                 {
-                    const FDMXFixtureMapping& M = W->DMXOutput->FixtureMappings[0];
+                    const FDMXFixtureMapping& M = W->DMXOutput->FixtureMappings[*Fix];
                     if (M.Profile)
                         return FText::FromString(M.Profile->GetName());
                     return FText::FromString(FString::Printf(TEXT("内蔵プリセット (未キャリブレーション): %s"),
@@ -857,10 +841,10 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
     // ソルバの出力 (送信値と状態)
     AddLabeledRow(LOCTEXT("DMXOutputStatus", "出力"),
         SNew(STextBlock)
-            .Text_Lambda([W]() -> FText {
-                if (!W.IsValid() || !W->DMXOutput || W->DMXOutput->FixtureStatus.Num() == 0)
+            .Text_Lambda([W, Fix]() -> FText {
+                if (!W.IsValid() || !W->DMXOutput || !W->DMXOutput->FixtureStatus.IsValidIndex(*Fix))
                     return LOCTEXT("DMXNoStatus", "(未送信)");
-                const FLightSyncFixtureStatus& St = W->DMXOutput->FixtureStatus[0];
+                const FLightSyncFixtureStatus& St = W->DMXOutput->FixtureStatus[*Fix];
                 FString Values;
                 for (uint8 V : St.Values)
                 {
@@ -871,9 +855,9 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 if (St.bClipped) Flags += TEXT("  [明るさ上限]");
                 return FText::FromString(FString::Printf(TEXT("%s (強さ %.0f%%)%s"), *Values.TrimEnd(), St.Intensity * 100.0f, *Flags));
             })
-            .ColorAndOpacity_Lambda([W]() -> FSlateColor {
-                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureStatus.Num() > 0
-                    && (W->DMXOutput->FixtureStatus[0].bOutOfGamut || W->DMXOutput->FixtureStatus[0].bClipped))
+            .ColorAndOpacity_Lambda([W, Fix]() -> FSlateColor {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureStatus.IsValidIndex(*Fix)
+                    && (W->DMXOutput->FixtureStatus[*Fix].bOutOfGamut || W->DMXOutput->FixtureStatus[*Fix].bClipped))
                     return FSlateColor(FLinearColor(1.0f, 0.75f, 0.3f));
                 return FSlateColor::UseForeground();
             }));
@@ -882,10 +866,10 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
     AddLabeledRow(LOCTEXT("DMXDimmer", "ディマー"),
         SNew(SSpinBox<float>)
             .MinValue(0.0f).MaxValue(1.0f).Delta(0.01f)
-            .Value_Lambda([W]() -> float {
+            .Value_Lambda([W, Fix]() -> float {
                 return (W.IsValid() && W->DMXOutput) ? W->DMXOutput->MasterDimmer : 1.0f;
             })
-            .OnValueChanged_Lambda([W](float V) {
+            .OnValueChanged_Lambda([W, Fix](float V) {
                 MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput) W->DMXOutput->MasterDimmer = V;
             }));
@@ -900,6 +884,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
     TWeakObjectPtr<ALightProbeActor> W(Probe);
 
     AddSectionHeader(LOCTEXT("SecOSC", "OSC出力設定"));
+    TSharedRef<int32> Tgt = OSCTargetIndex;
 
     if (!Probe->OSCOutput)
     {
@@ -913,11 +898,11 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
     // OSC有効
     AddLabeledRow(LOCTEXT("OSCEnabled", "OSC有効"),
         SNew(SCheckBox)
-            .IsChecked_Lambda([W]() -> ECheckBoxState {
+            .IsChecked_Lambda([W, Tgt]() -> ECheckBoxState {
                 return (W.IsValid() && W->OSCOutput && W->OSCOutput->bOSCOutputEnabled)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
-            .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+            .OnCheckStateChanged_Lambda([W, Tgt](ECheckBoxState S) {
                 MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput)
                     W->OSCOutput->bOSCOutputEnabled = (S == ECheckBoxState::Checked);
@@ -926,12 +911,12 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
     // OSCプローブ名
     AddLabeledRow(LOCTEXT("OSCProbeName", "OSCプローブ名"),
         SNew(SEditableTextBox)
-            .Text_Lambda([W]() -> FText {
+            .Text_Lambda([W, Tgt]() -> FText {
                 return (W.IsValid() && W->OSCOutput)
                     ? FText::FromString(W->OSCOutput->OSCProbeName)
                     : FText::GetEmpty();
             })
-            .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+            .OnTextCommitted_Lambda([W, Tgt](const FText& T, ETextCommit::Type) {
                 MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput)
                     W->OSCOutput->OSCProbeName = T.ToString();
@@ -940,17 +925,67 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
     // バンドル送信
     AddLabeledRow(LOCTEXT("BundleMsg", "バンドル送信"),
         SNew(SCheckBox)
-            .IsChecked_Lambda([W]() -> ECheckBoxState {
+            .IsChecked_Lambda([W, Tgt]() -> ECheckBoxState {
                 return (W.IsValid() && W->OSCOutput && W->OSCOutput->bUseBundleMessage)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
-            .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+            .OnCheckStateChanged_Lambda([W, Tgt](ECheckBoxState S) {
                 MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput)
                     W->OSCOutput->bUseBundleMessage = (S == ECheckBoxState::Checked);
             }));
 
     // --- ターゲット #1 ---
+
+    // --- 送信先の選択と追加 / 削除 ---
+    {
+        const int32 Num = Probe->OSCOutput ? Probe->OSCOutput->Targets.Num() : 0;
+        *Tgt = FMath::Clamp(*Tgt, 0, FMath::Max(Num - 1, 0));
+        AddLabeledRow(LOCTEXT("OSCTgtSelect", "送信先"),
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(0.3f)
+                [SNew(SSpinBox<int32>)
+                    .MinValue(0).MaxValue(FMath::Max(Num - 1, 0)).Delta(1)
+                    .Value_Lambda([Tgt]() { return *Tgt; })
+                    .OnValueChanged_Lambda([Tgt](int32 V) { *Tgt = V; })]
+            + SHorizontalBox::Slot().FillWidth(0.4f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
+                [SNew(STextBlock)
+                    .Text_Lambda([W, Tgt]() -> FText {
+                        if (!W.IsValid() || !W->OSCOutput || !W->OSCOutput->Targets.IsValidIndex(*Tgt)) return LOCTEXT("OSCTgtNone", "(なし)");
+                        return FText::FromString(FString::Printf(TEXT("%d / %d  %s"), *Tgt + 1, W->OSCOutput->Targets.Num(),
+                            *W->OSCOutput->Targets[*Tgt].TargetName));
+                    })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+                [SNew(SButton)
+                    .Text(LOCTEXT("OSCTgtAdd", "追加"))
+                    .OnClicked_Lambda([this, W, Tgt]() {
+                        if (W.IsValid() && W->OSCOutput)
+                        {
+                            MarkProbeDirty(W);
+                            W->OSCOutput->Modify();
+                            W->OSCOutput->Targets.Add(FOSCTargetConfig());
+                            *Tgt = W->OSCOutput->Targets.Num() - 1;
+                            RefreshSettingsPanel();
+                        }
+                        return FReply::Handled();
+                    })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+                [SNew(SButton)
+                    .Text(LOCTEXT("OSCTgtRemove", "削除"))
+                    .IsEnabled_Lambda([W, Tgt]() { return W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt); })
+                    .OnClicked_Lambda([this, W, Tgt]() {
+                        if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                        {
+                            MarkProbeDirty(W);
+                            W->OSCOutput->Modify();
+                            W->OSCOutput->Targets.RemoveAt(*Tgt);
+                            *Tgt = FMath::Max(*Tgt - 1, 0);
+                            RefreshSettingsPanel();
+                        }
+                        return FReply::Handled();
+                    })]);
+    }
+
     if (Probe->OSCOutput->Targets.Num() == 0)
     {
         SettingsPanelBox->AddSlot().AutoHeight().Padding(8.0f, 2.0f)
@@ -968,58 +1003,58 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
     // ターゲット有効
     AddLabeledRow(LOCTEXT("TargetEnabled", "有効"),
         SNew(SCheckBox)
-            .IsChecked_Lambda([W]() -> ECheckBoxState {
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    return W->OSCOutput->Targets[0].bEnabled
+            .IsChecked_Lambda([W, Tgt]() -> ECheckBoxState {
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    return W->OSCOutput->Targets[*Tgt].bEnabled
                         ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
                 return ECheckBoxState::Unchecked;
             })
-            .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+            .OnCheckStateChanged_Lambda([W, Tgt](ECheckBoxState S) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    W->OSCOutput->Targets[0].bEnabled = (S == ECheckBoxState::Checked);
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    W->OSCOutput->Targets[*Tgt].bEnabled = (S == ECheckBoxState::Checked);
             }));
 
     // ターゲット名
     AddLabeledRow(LOCTEXT("TargetName", "ターゲット名"),
         SNew(SEditableTextBox)
-            .Text_Lambda([W]() -> FText {
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    return FText::FromString(W->OSCOutput->Targets[0].TargetName);
+            .Text_Lambda([W, Tgt]() -> FText {
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    return FText::FromString(W->OSCOutput->Targets[*Tgt].TargetName);
                 return FText::GetEmpty();
             })
-            .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+            .OnTextCommitted_Lambda([W, Tgt](const FText& T, ETextCommit::Type) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    W->OSCOutput->Targets[0].TargetName = T.ToString();
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    W->OSCOutput->Targets[*Tgt].TargetName = T.ToString();
             }));
 
     // IPアドレス
     AddLabeledRow(LOCTEXT("OSCZone", "ゾーン"),
         SNew(SEditableTextBox)
-            .Text_Lambda([W]() -> FText {
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    return FText::FromName(W->OSCOutput->Targets[0].Zone);
+            .Text_Lambda([W, Tgt]() -> FText {
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    return FText::FromName(W->OSCOutput->Targets[*Tgt].Zone);
                 return FText::GetEmpty();
             })
-            .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+            .OnTextCommitted_Lambda([W, Tgt](const FText& T, ETextCommit::Type) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    W->OSCOutput->Targets[0].Zone = FName(*T.ToString());
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    W->OSCOutput->Targets[*Tgt].Zone = FName(*T.ToString());
             }));
 
     AddLabeledRow(LOCTEXT("OSCIP", "IPアドレス"),
         SNew(SEditableTextBox)
-            .Text_Lambda([W]() -> FText {
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    return FText::FromString(W->OSCOutput->Targets[0].IPAddress);
+            .Text_Lambda([W, Tgt]() -> FText {
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    return FText::FromString(W->OSCOutput->Targets[*Tgt].IPAddress);
                 return FText::GetEmpty();
             })
-            .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+            .OnTextCommitted_Lambda([W, Tgt](const FText& T, ETextCommit::Type) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
                 {
-                    W->OSCOutput->Targets[0].IPAddress = T.ToString();
+                    W->OSCOutput->Targets[*Tgt].IPAddress = T.ToString();
                     W->OSCOutput->ReconnectAll();
                 }
             }));
@@ -1028,61 +1063,49 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
     AddLabeledRow(LOCTEXT("OSCPort", "ポート"),
         SNew(SSpinBox<int32>)
             .MinValue(1).MaxValue(65535).Delta(1)
-            .Value_Lambda([W]() -> int32 {
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    return W->OSCOutput->Targets[0].Port;
+            .Value_Lambda([W, Tgt]() -> int32 {
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    return W->OSCOutput->Targets[*Tgt].Port;
                 return 7700;
             })
-            .OnValueChanged_Lambda([W](int32 V) {
+            .OnValueChanged_Lambda([W, Tgt](int32 V) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
                 {
-                    W->OSCOutput->Targets[0].Port = V;
+                    W->OSCOutput->Targets[*Tgt].Port = V;
                     W->OSCOutput->ReconnectAll();
                 }
             }));
 
     // フォーマット (スピンボックス + ラベル)
     AddLabeledRow(LOCTEXT("OSCFormat", "フォーマット"),
-        SNew(SHorizontalBox)
-        + SHorizontalBox::Slot().FillWidth(0.35f)
-            [SNew(SSpinBox<int32>)
-                .MinValue(0).MaxValue(NumOSCFormats - 1).Delta(1)
-                .Value_Lambda([W]() -> int32 {
-                    if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                        return static_cast<int32>(W->OSCOutput->Targets[0].Format);
-                    return 0;
-                })
-                .OnValueChanged_Lambda([W](int32 V) {
-                    MarkProbeDirty(W);
-                    if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                        W->OSCOutput->Targets[0].Format = static_cast<EOSCMessageFormat>(V);
-                })]
-        + SHorizontalBox::Slot().FillWidth(0.65f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
-            [SNew(STextBlock)
-                .Text_Lambda([W]() -> FText {
-                    if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    {
-                        int32 Idx = FMath::Clamp(
-                            static_cast<int32>(W->OSCOutput->Targets[0].Format),
-                            0, NumOSCFormats - 1);
-                        return FText::FromString(OSCFormatNames[Idx]);
-                    }
-                    return FText::GetEmpty();
-                })]);
+        SNew(SEnumComboBox, StaticEnum<EOSCMessageFormat>())
+            .CurrentValue_Lambda([W, Tgt]() -> int32 { return (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt)) ? static_cast<int32>(W->OSCOutput->Targets[*Tgt].Format) : 0; })
+            .OnEnumSelectionChanged_Lambda([W, Tgt](int32 V, ESelectInfo::Type) { MarkProbeDirty(W); if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt)) W->OSCOutput->Targets[*Tgt].Format = static_cast<EOSCMessageFormat>(V); }));
+
+    AddLabeledRow(LOCTEXT("OSCValueMode", "送る値"),
+        SNew(SEnumComboBox, StaticEnum<EOSCColorValue>())
+            .CurrentValue_Lambda([W, Tgt]() -> int32 {
+                return (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt)) ? static_cast<int32>(W->OSCOutput->Targets[*Tgt].ValueMode) : 0;
+            })
+            .OnEnumSelectionChanged_Lambda([W, Tgt](int32 V, ESelectInfo::Type) {
+                MarkProbeDirty(W);
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    W->OSCOutput->Targets[*Tgt].ValueMode = static_cast<EOSCColorValue>(V);
+            }));
 
     // アドレス接頭辞
     AddLabeledRow(LOCTEXT("OSCPrefix", "アドレス接頭辞"),
         SNew(SEditableTextBox)
-            .Text_Lambda([W]() -> FText {
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    return FText::FromString(W->OSCOutput->Targets[0].AddressPrefix);
+            .Text_Lambda([W, Tgt]() -> FText {
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    return FText::FromString(W->OSCOutput->Targets[*Tgt].AddressPrefix);
                 return FText::GetEmpty();
             })
-            .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+            .OnTextCommitted_Lambda([W, Tgt](const FText& T, ETextCommit::Type) {
                 MarkProbeDirty(W);
-                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
-                    W->OSCOutput->Targets[0].AddressPrefix = T.ToString();
+                if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.IsValidIndex(*Tgt))
+                    W->OSCOutput->Targets[*Tgt].AddressPrefix = T.ToString();
             }));
 }
 
@@ -1201,18 +1224,9 @@ void SLightSyncMonitorWidget::BuildCalibrationSection(ALightProbeActor* Probe)
 
     // --- カメラ ---
     AddLabeledRow(LOCTEXT("CalTransfer", "カメラの記録方式"),
-        SNew(SHorizontalBox)
-        + SHorizontalBox::Slot().FillWidth(0.3f)
-            [SNew(SSpinBox<int32>)
-                .MinValue(0).MaxValue(static_cast<int32>(ELightSyncCameraTransfer::SonySLog3)).Delta(1)
-                .Value_Lambda([C]() { return C.IsValid() ? static_cast<int32>(C->CameraTransfer) : 0; })
-                .OnValueChanged_Lambda([C](int32 V) { if (C.IsValid()) C->CameraTransfer = static_cast<ELightSyncCameraTransfer>(V); })]
-        + SHorizontalBox::Slot().FillWidth(0.7f).VAlign(VAlign_Center).Padding(6.0f, 0.0f)
-            [SNew(STextBlock)
-                .Text_Lambda([C]() {
-                    return C.IsValid() ? StaticEnum<ELightSyncCameraTransfer>()->GetDisplayNameTextByValue(static_cast<int64>(C->CameraTransfer))
-                                       : FText::GetEmpty();
-                })]);
+        SNew(SEnumComboBox, StaticEnum<ELightSyncCameraTransfer>())
+            .CurrentValue_Lambda([C]() -> int32 { return C.IsValid() ? static_cast<int32>(C->CameraTransfer) : 0; })
+            .OnEnumSelectionChanged_Lambda([C](int32 V, ESelectInfo::Type) { if (C.IsValid()) C->CameraTransfer = static_cast<ELightSyncCameraTransfer>(V); }));
 
     AddLabeledRow(LOCTEXT("CalFeed", "カメラ映像 (任意)"),
         SNew(SObjectPropertyEntryBox)

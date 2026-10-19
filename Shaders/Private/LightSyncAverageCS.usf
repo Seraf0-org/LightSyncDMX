@@ -13,15 +13,20 @@
 //             Ring                   : sinθ / π²             (軸に垂直な面の照度を全方位で平均 / π)
 //             Sphere                 : 1 / 4π                (全方位の平均放射輝度)
 //
-// 3 パス構成:
-//   MainPeakCS   : 面ごとにブロック平均輝度が最大の方向を探す (粗い Key 方向)
-//   MainRefineCS : 粗い方向の周りのコーン内で輝度重心を求める (Key 方向の精密化)
-//   MainZonesCS  : 全ゾーンを積分する
+// パス構成 (面は SV_GroupID.z。6 面を 1 回のディスパッチで処理する):
+//   MainPeakCS         (1,1,6) : 面ごとにブロック (1 辺 16 分割) 平均輝度が最大の方向 (粗い Key 方向)
+//   MainRefineCS       (G,G,6) : 粗い方向の周りのコーン内で輝度重心の部分和 (Key 方向の精密化)
+//   MainRefineReduceCS (1,1,1) : 部分和を合計
+//   MainZonesCS        (G,G,6) : 全ゾーンの部分和
+//   MainZonesReduceCS  (1,1,1) : 部分和を合計
+//   G = clamp(ceil(N / 16), 1, 8)。グループを多く出して GPU 全体を使う
 //
 // 出力バッファ (float4):
-//   [0..5]                           : 面ごとのピーク (dir.xyz, 平均輝度)
-//   [6..11]                          : 面ごとの重心の部分和 (Σ lum·dir·dΩ, Σ lum·dΩ)
-//   [12 + Face * MAX_ZONES + Zone]   : (Σ L·m·g·dΩ の rgb, Σ m·dΩ)
+//   [0..5]       : 面ごとのピーク (dir.xyz, 平均輝度)
+//   [6]          : 重心の合計 (Σ lum·dir·dΩ, Σ lum·dΩ)
+//   [8..15]      : ゾーンの合計 (Σ L·m·g·dΩ の rgb, Σ m·dΩ)      ← CPU に読み戻すのはここまで
+//   [16..]       : 重心の部分和 (グループごと)
+//   [16+384..]   : ゾーンの部分和 (グループごと × MAX_ZONES)
 
 #include "/Engine/Public/Platform.ush"
 
@@ -44,7 +49,7 @@ SamplerState        InputSampler;
 RWStructuredBuffer<float4> OutputBuffer;
 
 uint  TextureSize;
-uint  FaceIndex;
+uint  GroupsPerSide;
 uint  NumZones;
 float PartitionSharpness;
 float3 LuminanceCoeffs;
@@ -58,11 +63,17 @@ float4 ZoneParams[MAX_ZONES];
 //   0 = リニア, 1 = sRGB EOTF, 2 = ガンマ 2.2, 3 = ガンマ 2.4
 uint InputTransfer;
 
+// デコード後に掛ける補正ガンマ (壁の実際の応答。キャリブレーションで求める。1 = なし)
+float TransferGamma;
+
 // 精密化に使うコーンの cos (最初の Key ゾーンの外縁。Key が無ければ 2 = 無効)
 float KeyRefineCos;
 
-#define REFINE_BASE 6u
-#define ZONES_BASE 12u
+#define REFINE_TOTAL 6u
+#define ZONES_TOTAL 8u
+#define MAX_GROUPS (6u * 8u * 8u)
+#define REFINE_PARTIALS 16u
+#define ZONE_PARTIALS (16u + MAX_GROUPS)
 
 groupshared float4 gs_Reduce[NUM_THREADS];
 
@@ -134,25 +145,77 @@ float3 DecodeTransfer(float3 v)
 float3 LoadRadiance(float3 dir)
 {
     float3 L = DecodeTransfer(InputCube.SampleLevel(InputSampler, dir, 0).rgb);
+    if (TransferGamma != 1.0f)
+    {
+        L = pow(max(L, 0.0f), TransferGamma);
+    }
     // NaN / 負値 / Inf を抑える (積分全体が壊れないように)。max は NaN に対して 0 を返す
     return clamp(L, 0.0f, 65504.0f);
 }
 
-void ThreadRange(uint2 tid, out uint2 start, out uint2 end)
+// Peak: 1 グループ / 面。スレッド = 1 辺 16 分割のブロック (CPU 版と同じ分割)
+void PeakRange(uint2 tid, out uint2 start, out uint2 end)
 {
     uint per = max(1u, (TextureSize + THREADS_X - 1u) / THREADS_X);
     start = tid * per;
     end = min(start + per, uint2(TextureSize, TextureSize));
 }
 
+// Refine / Zones: G×G グループ / 面。全スレッドで面を等分する
+void GridRange(uint2 groupId, uint2 tid, out uint2 start, out uint2 end)
+{
+    uint threadsPerSide = THREADS_X * GroupsPerSide;
+    uint per = max(1u, (TextureSize + threadsPerSide - 1u) / threadsPerSide);
+    start = (groupId * THREADS_X + tid) * per;
+    end = min(start + per, uint2(TextureSize, TextureSize));
+}
+
+uint GroupLinear(uint3 groupId)
+{
+    return (groupId.z * GroupsPerSide + groupId.y) * GroupsPerSide + groupId.x;
+}
+
+// グループ内の合計 (全スレッドが呼ぶこと)
+float4 GroupSum(uint GroupIndex, float4 value)
+{
+    gs_Reduce[GroupIndex] = value;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = NUM_THREADS / 2u; stride > 0u; stride >>= 1u)
+    {
+        if (GroupIndex < stride)
+        {
+            gs_Reduce[GroupIndex] += gs_Reduce[GroupIndex + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float4 result = gs_Reduce[0];
+    GroupMemoryBarrierWithGroupSync();
+    return result;
+}
+
+float4 CoarsePeak()
+{
+    float4 peak = OutputBuffer[0];
+    for (uint f = 1u; f < 6u; ++f)
+    {
+        float4 p = OutputBuffer[f];
+        if (p.w > peak.w)
+        {
+            peak = p;
+        }
+    }
+    return peak;
+}
+
 // -------------------------------------------------------------------
 // Pass 1: ピーク探索 (スレッドごとのブロック平均輝度の最大)
 // -------------------------------------------------------------------
 [numthreads(THREADS_X, THREADS_Y, 1)]
-void MainPeakCS(uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
+void MainPeakCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
 {
+    const uint face = GroupId.z;
     uint2 start, end;
-    ThreadRange(GroupThreadId.xy, start, end);
+    PeakRange(GroupThreadId.xy, start, end);
 
     float  lumSum = 0.0f;
     float  omegaSum = 0.0f;
@@ -163,7 +226,7 @@ void MainPeakCS(uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_Gro
         for (uint x = start.x; x < end.x; ++x)
         {
             float2 uv = (float2(x, y) + 0.5f) / (float)TextureSize;
-            float3 dir = normalize(FaceUVToDirection(FaceIndex, uv));
+            float3 dir = normalize(FaceUVToDirection(face, uv));
             float dOmega = TexelSolidAngle(uv) * ExclusionKeep(dir);
             float lum = dot(LoadRadiance(dir), LuminanceCoeffs);
             lumSum += lum * dOmega;
@@ -188,43 +251,30 @@ void MainPeakCS(uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_Gro
 
     if (GroupIndex == 0u)
     {
-        OutputBuffer[FaceIndex] = gs_Reduce[0];
+        OutputBuffer[face] = gs_Reduce[0];
     }
-}
-
-float4 CoarsePeak()
-{
-    float4 peak = OutputBuffer[0];
-    for (uint f = 1u; f < 6u; ++f)
-    {
-        float4 p = OutputBuffer[f];
-        if (p.w > peak.w)
-        {
-            peak = p;
-        }
-    }
-    return peak;
 }
 
 // -------------------------------------------------------------------
-// Pass 2: Key 方向の精密化 (粗いピークの周りのコーン内で輝度重心)
+// Pass 2: Key 方向の精密化 (粗いピークの周りのコーン内で輝度重心の部分和)
 // -------------------------------------------------------------------
 [numthreads(THREADS_X, THREADS_Y, 1)]
-void MainRefineCS(uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
+void MainRefineCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
 {
+    const uint face = GroupId.z;
     float4 peak = CoarsePeak();
     float4 acc = 0.0f;
 
     if (peak.w > 0.0f && KeyRefineCos <= 1.0f)
     {
         uint2 start, end;
-        ThreadRange(GroupThreadId.xy, start, end);
+        GridRange(GroupId.xy, GroupThreadId.xy, start, end);
         for (uint y = start.y; y < end.y; ++y)
         {
             for (uint x = start.x; x < end.x; ++x)
             {
                 float2 uv = (float2(x, y) + 0.5f) / (float)TextureSize;
-                float3 dir = normalize(FaceUVToDirection(FaceIndex, uv));
+                float3 dir = normalize(FaceUVToDirection(face, uv));
                 if (dot(dir, peak.xyz) < KeyRefineCos)
                 {
                     continue;
@@ -235,35 +285,40 @@ void MainRefineCS(uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_G
         }
     }
 
-    gs_Reduce[GroupIndex] = acc;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint stride = NUM_THREADS / 2u; stride > 0u; stride >>= 1u)
-    {
-        if (GroupIndex < stride)
-        {
-            gs_Reduce[GroupIndex] += gs_Reduce[GroupIndex + stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
+    float4 sum = GroupSum(GroupIndex, acc);
     if (GroupIndex == 0u)
     {
-        OutputBuffer[REFINE_BASE + FaceIndex] = gs_Reduce[0];
+        OutputBuffer[REFINE_PARTIALS + GroupLinear(GroupId)] = sum;
+    }
+}
+
+[numthreads(THREADS_X, THREADS_Y, 1)]
+void MainRefineReduceCS(uint GroupIndex : SV_GroupIndex)
+{
+    const uint count = 6u * GroupsPerSide * GroupsPerSide;
+    float4 acc = 0.0f;
+    for (uint i = GroupIndex; i < count; i += NUM_THREADS)
+    {
+        acc += OutputBuffer[REFINE_PARTIALS + i];
+    }
+    float4 sum = GroupSum(GroupIndex, acc);
+    if (GroupIndex == 0u)
+    {
+        OutputBuffer[REFINE_TOTAL] = sum;
     }
 }
 
 // -------------------------------------------------------------------
-// Pass 3: ゾーン積分
+// Pass 3: ゾーン積分 (部分和)
 // -------------------------------------------------------------------
 [numthreads(THREADS_X, THREADS_Y, 1)]
-void MainZonesCS(uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
+void MainZonesCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
 {
+    const uint face = GroupId.z;
+
     // 粗いピーク → 精密化した重心方向
     float4 peak = CoarsePeak();
-    float4 refine = 0.0f;
-    for (uint f = 0u; f < 6u; ++f)
-    {
-        refine += OutputBuffer[REFINE_BASE + f];
-    }
+    float4 refine = OutputBuffer[REFINE_TOTAL];
     float3 keyDir = (refine.w > 0.0f && dot(refine.xyz, refine.xyz) > 0.0f) ? normalize(refine.xyz) : peak.xyz;
     bool bHasKey = peak.w > 0.0f;
 
@@ -274,14 +329,14 @@ void MainZonesCS(uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_Gr
     }
 
     uint2 start, end;
-    ThreadRange(GroupThreadId.xy, start, end);
+    GridRange(GroupId.xy, GroupThreadId.xy, start, end);
 
     for (uint y = start.y; y < end.y; ++y)
     {
         for (uint x = start.x; x < end.x; ++x)
         {
             float2 uv = (float2(x, y) + 0.5f) / (float)TextureSize;
-            float3 dir = normalize(FaceUVToDirection(FaceIndex, uv));
+            float3 dir = normalize(FaceUVToDirection(face, uv));
             float dOmega = TexelSolidAngle(uv);
             float3 L = LoadRadiance(dir);
             float keep = ExclusionKeep(dir);
@@ -373,25 +428,33 @@ void MainZonesCS(uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_Gr
         }
     }
 
-    // ゾーンごとにグループ内で合計して書き出す
+    // ゾーンごとにグループ内で合計して部分和として書き出す
+    const uint groupLinear = GroupLinear(GroupId);
     for (uint z3 = 0; z3 < MAX_ZONES; ++z3)
     {
-        gs_Reduce[GroupIndex] = acc[z3];
-        GroupMemoryBarrierWithGroupSync();
-
-        for (uint stride = NUM_THREADS / 2u; stride > 0u; stride >>= 1u)
-        {
-            if (GroupIndex < stride)
-            {
-                gs_Reduce[GroupIndex] += gs_Reduce[GroupIndex + stride];
-            }
-            GroupMemoryBarrierWithGroupSync();
-        }
-
+        float4 sum = GroupSum(GroupIndex, acc[z3]);
         if (GroupIndex == 0u)
         {
-            OutputBuffer[ZONES_BASE + FaceIndex * MAX_ZONES + z3] = gs_Reduce[0];
+            OutputBuffer[ZONE_PARTIALS + groupLinear * MAX_ZONES + z3] = sum;
         }
-        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+[numthreads(THREADS_X, THREADS_Y, 1)]
+void MainZonesReduceCS(uint GroupIndex : SV_GroupIndex)
+{
+    const uint count = 6u * GroupsPerSide * GroupsPerSide;
+    for (uint z = 0; z < MAX_ZONES; ++z)
+    {
+        float4 acc = 0.0f;
+        for (uint i = GroupIndex; i < count; i += NUM_THREADS)
+        {
+            acc += OutputBuffer[ZONE_PARTIALS + i * MAX_ZONES + z];
+        }
+        float4 sum = GroupSum(GroupIndex, acc);
+        if (GroupIndex == 0u)
+        {
+            OutputBuffer[ZONES_TOTAL + z] = sum;
+        }
     }
 }

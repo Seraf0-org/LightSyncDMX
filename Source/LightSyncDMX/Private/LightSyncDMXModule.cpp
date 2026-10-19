@@ -8,11 +8,39 @@
 #include "HAL/IConsoleManager.h"
 #include "UObject/UObjectIterator.h"
 #include "LightColorSamplerComponent.h"
+#include "LightProbeActor.h"
 #include "GameFramework/Actor.h"
+#include "Misc/CoreDelegates.h"
+#include "Engine/World.h"
+#include "LightSyncSettings.h"
+#include "LightSyncDirectOutput.h"
 
 #define LOCTEXT_NAMESPACE "FLightSyncDMXModule"
 
 DEFINE_LOG_CATEGORY(LogLightSyncDMX);
+
+// 性能: 全プローブのキャプチャ数・省略数・遅延・ゲームスレッド時間
+static FAutoConsoleCommand GLightSyncStatsCommand(
+    TEXT("LightSync.Stats"),
+    TEXT("全 LightProbe のキャプチャ数 / 結果待ちで省いた数 / フレーム上限で持ち越した数 / 結果の遅延 / ゲームスレッド時間を表示"),
+    FConsoleCommandDelegate::CreateLambda([]()
+    {
+        for (TObjectIterator<ALightProbeActor> It; It; ++It)
+        {
+            const ALightProbeActor *Probe = *It;
+            if (!IsValid(Probe) || Probe->IsTemplate() || !Probe->GetWorld())
+            {
+                continue;
+            }
+            FString Reason;
+            const bool bOutput = LightSyncOutput::CanOutput(Probe->GetWorld(), &Reason);
+            UE_LOG(LogLightSyncDMX, Display,
+                   TEXT("LIGHTSYNC_STATS probe='%s' world=%s captures=%d skipped_busy=%d deferred_budget=%d latency_ms=%.1f gt_ms=%.3f output=%s (%s)"),
+                   *Probe->ProbeName, *Probe->GetWorld()->GetName(), Probe->CapturesPerformed, Probe->CapturesSkippedBusy,
+                   Probe->CapturesDeferredBudget, Probe->ColorSampler ? Probe->ColorSampler->LastResultLatencyMs : 0.0f,
+                   Probe->AvgCaptureGameThreadMs, bOutput ? TEXT("yes") : TEXT("no"), *Reason);
+        }
+    }));
 
 // 検証用: 全プローブで GPU 積分結果と CPU 版 (同じ式) を比べる
 static FAutoConsoleCommand GLightSyncValidateGPUCommand(
@@ -49,6 +77,32 @@ static FAutoConsoleCommand GLightSyncValidateGPUCommand(
 
 void FLightSyncDMXModule::StartupModule()
 {
+    // 終了処理では UE の DMX ポートが送信を止めるので、自前で直接ブラックアウトを送る。
+    // 1) 終了が要求された直後のフレーム: コンソールウィンドウを閉じた場合などは、終了処理の途中で
+    //    OS にプロセスを止められる (約 5 秒) ので、OnPreExit を待たずにすぐ送る
+    ExitPollHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([](float)
+    {
+        if (!IsEngineExitRequested())
+        {
+            return true;
+        }
+        if (GetDefault<ULightSyncSettings>()->bDirectBlackoutOnExit)
+        {
+            LightSyncDirectOutput::SendBlackoutNow();
+        }
+        return false; // 一度だけ
+    }));
+
+    // 2) 終了処理の最後にもう一度 (1 の後に出た値も消す)
+    PreExitHandle = FCoreDelegates::OnPreExit.AddLambda([]()
+    {
+        if (GetDefault<ULightSyncSettings>()->bDirectBlackoutOnExit)
+        {
+            LightSyncDirectOutput::SendBlackoutNow();
+        }
+        LightSyncDirectOutput::Reset();
+    });
+
     // Shaders/ ディレクトリを仮想パス "/LightSyncDMX" にマップする。
     // これにより IMPLEMENT_GLOBAL_SHADER の第2引数
     // "/LightSyncDMX/Private/LightSyncAverageCS.usf" が解決される。
@@ -70,6 +124,9 @@ void FLightSyncDMXModule::StartupModule()
 
 void FLightSyncDMXModule::ShutdownModule()
 {
+    FCoreDelegates::OnPreExit.Remove(PreExitHandle);
+    FTSTicker::RemoveTicker(ExitPollHandle);
+
     UE_LOG(LogLightSyncDMX, Log, TEXT("LightSyncDMX module shutdown."));
 }
 

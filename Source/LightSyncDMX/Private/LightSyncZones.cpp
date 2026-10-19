@@ -129,6 +129,10 @@ namespace LightSyncZones
         auto Clean = [&Setup](float V)
         {
             V = DecodeTransfer(Setup.InputTransfer, V);
+            if (Setup.TransferGamma != 1.0f)
+            {
+                V = FMath::Pow(FMath::Max(V, 0.0f), Setup.TransferGamma);
+            }
             return FMath::IsNaN(V) ? 0.0f : FMath::Clamp(V, 0.0f, 65504.0f);
         };
         return FVector3f(Clean(C.R), Clean(C.G), Clean(C.B));

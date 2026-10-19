@@ -15,9 +15,12 @@
 #include "HAL/IConsoleManager.h"
 #include "LightSyncNDisplay.h"
 #include "LightSyncSubsystem.h"
+#include "LightSyncSettings.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
 #include "Misc/App.h"
+#include "HAL/PlatformTime.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 ALightProbeActor::ALightProbeActor()
 {
@@ -110,6 +113,8 @@ void ALightProbeActor::BeginPlay()
 {
     Super::BeginPlay();
 
+    SamplingTimer = FMath::Frac(static_cast<float>(GetUniqueID()) * 0.6180339f) / FMath::Max(SamplingRate, 1.0f);
+
     EnsureCaptureInitialized();
 
     // サブシステムに自身を登録
@@ -135,6 +140,14 @@ void ALightProbeActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
             Subsystem->UnregisterProbe(this);
         }
     }
+
+    // 性能の診断用に統計を残す
+    const float PlaySeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+    UE_LOG(LogLightSyncDMX, Log,
+           TEXT("LIGHTSYNC_STATS probe='%s' seconds=%.1f captures=%d (%.1f/s) skipped_busy=%d deferred_budget=%d latency_ms=%.1f gt_ms=%.3f"),
+           *ProbeName, PlaySeconds, CapturesPerformed, PlaySeconds > 0.0f ? CapturesPerformed / PlaySeconds : 0.0f,
+           CapturesSkippedBusy, CapturesDeferredBudget, ColorSampler ? ColorSampler->LastResultLatencyMs : 0.0f,
+           AvgCaptureGameThreadMs);
 
     Super::EndPlay(EndPlayReason);
 
@@ -229,14 +242,30 @@ void ALightProbeActor::Tick(float DeltaTime)
         return;
     }
 
-    // サンプリングレートに基づく更新制御
+    // 1) 結果が届いていれば、サンプリング間隔を待たずにすぐ出力する (遅延を最小に)
+    if (ColorSampler && ColorSampler->PollNewResult())
+    {
+        SendOutputs();
+    }
+
+    // 照明を送らない PC (nDisplay の送信ノード以外など) ではキャプチャしない。描画の負荷だけが増えるため
+    const UWorld *World = GetWorld();
+    if (!bSampleWhenNotOutputting && World && World->IsGameWorld() && !LightSyncOutput::CanOutput(World))
+    {
+        return;
+    }
+
+    // 2) サンプリングレートに基づくキャプチャ。結果待ち / フレームの上限なら次フレームに持ち越す
     SamplingTimer += DeltaTime;
     const float SamplingInterval = 1.0f / FMath::Max(SamplingRate, 1.0f);
-
-    if (SamplingTimer >= SamplingInterval)
+    if (SamplingTimer >= SamplingInterval && TryCaptureAndDispatch(true))
     {
         SamplingTimer = FMath::Fmod(SamplingTimer, SamplingInterval);
-        ForceSampleOnce();
+    }
+    else
+    {
+        // 持ち越し中に溜まりすぎないように 1 間隔分までにとどめる
+        SamplingTimer = FMath::Min(SamplingTimer, SamplingInterval);
     }
 }
 
@@ -261,6 +290,17 @@ void ALightProbeActor::SetProbeActive(bool bActive)
 
 void ALightProbeActor::ForceSampleOnce()
 {
+    TryCaptureAndDispatch(false);
+    if (ColorSampler && ColorSampler->PollNewResult())
+    {
+        SendOutputs();
+    }
+}
+
+bool ALightProbeActor::TryCaptureAndDispatch(bool bRespectBudget)
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(LightSync_ProbeCapture);
+
     // エディタモードで呼ばれた場合に備えて遅延初期化
     EnsureCaptureInitialized();
 
@@ -270,31 +310,55 @@ void ALightProbeActor::ForceSampleOnce()
         UpdateRenderTarget();
     }
 
-    if (!SceneCapture || !CaptureRenderTarget)
+    if (!SceneCapture || !CaptureRenderTarget || !ColorSampler)
     {
-        return;
+        return false;
     }
 
-    // 1) 基準モードに合わせてキャプチャ設定を更新し、キュービックキャプチャを実行
+    // 前回の GPU 結果を待っている間はキャプチャしない (6 面のレンダリングが無駄になる)
+    if (!ColorSampler->CanDispatch())
+    {
+        ++CapturesSkippedBusy;
+        return false;
+    }
+
+    // 1 フレームのキャプチャ数の上限 (多数のプローブでフレーム時間が跳ねないように)
+    if (bRespectBudget)
+    {
+        ULightSyncSubsystem *Subsystem = GetWorld() ? GetWorld()->GetSubsystem<ULightSyncSubsystem>() : nullptr;
+        if (Subsystem && !Subsystem->TryReserveCapture(this))
+        {
+            ++CapturesDeferredBudget;
+            return false;
+        }
+    }
+
+    const uint64 StartCycles = FPlatformTime::Cycles64();
+
     const FLightSyncSampleContext Context = ApplyCaptureSettings();
     SceneCapture->CaptureScene();
+    ColorSampler->Dispatch(CaptureRenderTarget, Context);
+    ++CapturesPerformed;
 
-    // 2) ゾーンごとに積分 (GPU 結果は 1〜2 フレーム後に反映)
-    if (ColorSampler)
-    {
-        ColorSampler->SampleFromRenderTarget(CaptureRenderTarget, Context);
-    }
+    const float Ms = static_cast<float>(FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64() - StartCycles));
+    AvgCaptureGameThreadMs = CapturesPerformed == 1 ? Ms : FMath::Lerp(AvgCaptureGameThreadMs, Ms, 0.1f);
+    return true;
+}
 
-    // 3) 出力 (キャリブレーション中は止める)
-    if (bSuspendOutput)
+void ALightProbeActor::SendOutputs()
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(LightSync_ProbeOutput);
+
+    // キャリブレーションのテスト点灯中は出力しない
+    if (bSuspendOutput || !ColorSampler)
     {
         return;
     }
-    if (bUseDMXOutput && DMXOutput && ColorSampler)
+    if (bUseDMXOutput && DMXOutput)
     {
         DMXOutput->SendZoneColors(ColorSampler->ZoneResults);
     }
-    if (bUseOSCOutput && OSCOutput && ColorSampler)
+    if (bUseOSCOutput && OSCOutput)
     {
         OSCOutput->SendZoneColors(ColorSampler->ZoneResults);
     }
@@ -405,12 +469,23 @@ FPostProcessSettings ALightProbeActor::BuildReferencePostProcess()
         return ScenePP;
     }
 
+    // リフレクションで設定を辿るので、毎サンプルではなく 0.25 秒ごとに作り直す
+    const double Now = FPlatformTime::Seconds();
+    const FString Key = FString::Printf(TEXT("%p|%s|%p"), NDisplayRootActor.Get(), *NDisplayViewportId, ReferenceCamera.Get());
+    if (CachedNDisplayTime >= 0.0 && Now - CachedNDisplayTime < 0.25 && Key == CachedNDisplayKey)
+    {
+        return CachedNDisplayPP;
+    }
+
     AActor *Root = NDisplayRootActor ? NDisplayRootActor.Get() : LightSyncNDisplay::FindRootActor(GetWorld());
     FPostProcessSettings Result;
     if (!LightSyncNDisplay::BuildOuterViewportPostProcess(Root, NDisplayViewportId, ScenePP, Result, NDisplayReport))
     {
-        return ScenePP;
+        Result = ScenePP;
     }
+    CachedNDisplayPP = Result;
+    CachedNDisplayTime = Now;
+    CachedNDisplayKey = Key;
     return Result;
 }
 
@@ -474,6 +549,7 @@ FLightSyncSampleContext ALightProbeActor::ApplyCaptureSettings()
         Context.ExposureScale = OutputGain; // 露出はエンジンが適用済み
         Context.bInputIsSRGBGamut = true;
         Context.InputTransfer = WallDisplayEOTF;
+        Context.TransferGamma = (DMXOutput && DMXOutput->StageCalibration) ? DMXOutput->StageCalibration->ReferenceGamma : 1.0f;
     }
     else
     {

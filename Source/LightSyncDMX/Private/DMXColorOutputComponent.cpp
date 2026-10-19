@@ -8,6 +8,8 @@
 #include "DMXProtocolTypes.h"
 #include "DMXProtocolConstants.h"
 #include "Library/DMXLibrary.h"
+#include "LightSyncSettings.h"
+#include "LightSyncDirectOutput.h"
 
 UDMXColorOutputComponent::UDMXColorOutputComponent()
 {
@@ -42,14 +44,14 @@ void UDMXColorOutputComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 // プロファイル / 計算
 // ============================================================
 
-FLightSyncFixtureProfileData UDMXColorOutputComponent::GetMappingProfile(const FDMXFixtureMapping &Mapping)
+const FLightSyncFixtureProfileData &UDMXColorOutputComponent::GetMappingProfile(const FDMXFixtureMapping &Mapping)
 {
-    return Mapping.Profile ? Mapping.Profile->Profile : LightSyncFixture::MakePreset(Mapping.ColorMode);
+    return Mapping.Profile ? Mapping.Profile->Profile : LightSyncFixture::GetPreset(Mapping.ColorMode);
 }
 
 int32 UDMXColorOutputComponent::GetChannelCount(ELightSyncColorMode Mode)
 {
-    return LightSyncFixture::MakePreset(Mode).GetChannelCount();
+    return LightSyncFixture::GetPreset(Mode).GetChannelCount();
 }
 
 int32 UDMXColorOutputComponent::GetMappingChannelCount(const FDMXFixtureMapping &Mapping)
@@ -156,7 +158,8 @@ void UDMXColorOutputComponent::SendRawToFixture(int32 FixtureIndex, const TArray
 {
     if (FixtureMappings.IsValidIndex(FixtureIndex))
     {
-        SendValues(FixtureMappings[FixtureIndex], Values);
+        // テスト点灯はオペレーターの明示的な操作なので、送信役の判定を通さない
+        SendValues(FixtureMappings[FixtureIndex], Values, nullptr, true);
     }
 }
 
@@ -167,7 +170,7 @@ void UDMXColorOutputComponent::Blackout()
     {
         const FDMXFixtureMapping &Mapping = FixtureMappings[Index];
         const FLightSyncFixtureOutput Output = LightSyncFixture::ComputeBlackout(GetMappingProfile(Mapping));
-        SendValues(Mapping, Output.Values);
+        SendValues(Mapping, Output.Values, &Output.Values);
 
         if (FixtureStatus.IsValidIndex(Index))
         {
@@ -194,7 +197,8 @@ void UDMXColorOutputComponent::SendFixture(int32 MappingIndex, const FLinearColo
 {
     const FDMXFixtureMapping &Mapping = FixtureMappings[MappingIndex];
     const FLightSyncFixtureOutput Output = ComputeFixtureOutput(Mapping, Color);
-    SendValues(Mapping, Output.Values);
+    const FLightSyncFixtureOutput BlackoutOutput = LightSyncFixture::ComputeBlackout(GetMappingProfile(Mapping));
+    SendValues(Mapping, Output.Values, &BlackoutOutput.Values);
 
     if (FixtureStatus.Num() != FixtureMappings.Num())
     {
@@ -243,8 +247,15 @@ void UDMXColorOutputComponent::GatherOutputPorts(TArray<FDMXOutputPortSharedRef>
     OutPorts = FDMXPortManager::Get().GetOutputPorts();
 }
 
-void UDMXColorOutputComponent::SendValues(const FDMXFixtureMapping &Mapping, const TArray<uint8> &Values)
+void UDMXColorOutputComponent::SendValues(const FDMXFixtureMapping &Mapping, const TArray<uint8> &Values,
+                                          const TArray<uint8> *BlackoutValues, bool bBypassAuthority)
 {
+    // nDisplay クラスタ等で、送信役でない PC からは送らない (二重送信の防止)
+    if (!bBypassAuthority && !LightSyncOutput::CanOutput(GetWorld()))
+    {
+        return;
+    }
+
     // ユニバース (512ch) をはみ出すマッピングは送信しない (隣のユニバースや無関係なchを汚さないため)
     if (!IsMappingInRange(Mapping))
     {
@@ -288,9 +299,22 @@ void UDMXColorOutputComponent::SendValues(const FDMXFixtureMapping &Mapping, con
 
     bWarnedNoOutputPorts = false;
 
+    TMap<int32, uint8> BlackoutData;
+    if (BlackoutValues)
+    {
+        for (int32 Offset = 0; Offset < FMath::Min(BlackoutValues->Num(), Count); ++Offset)
+        {
+            BlackoutData.Add(Mapping.StartChannel + Offset, (*BlackoutValues)[Offset]);
+        }
+    }
+
     for (const FDMXOutputPortSharedRef &OutputPort : OutputPorts)
     {
         OutputPort->SendDMX(Mapping.Universe, ChannelData);
+        if (BlackoutData.Num() > 0)
+        {
+            LightSyncDirectOutput::RecordChannels(OutputPort->GetPortGuid(), Mapping.Universe, BlackoutData);
+        }
     }
 
     UE_LOG(LogLightSyncDMX, VeryVerbose, TEXT("DMX Sent: Fixture='%s' Univ=%d Ch=%d (%d ch)"),

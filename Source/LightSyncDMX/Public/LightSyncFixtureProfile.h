@@ -218,6 +218,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Calibration")
     FLinearColor ReferenceBlue = FLinearColor(0.0f, 0.0f, 1.0f);
 
+    /**
+     * 壁の応答の補正ガンマ。Wall モードで、表示特性 (sRGB 等) でデコードした値にさらに掛ける。
+     * LED プロセッサの実際のカーブが想定とずれている分を、壁の明るさを変えたパッチの測定から求める。1 = 補正なし
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Calibration", meta = (ClampMin = "0.2", ClampMax = "5.0"))
+    float ReferenceGamma = 1.0f;
+
     LightSyncColor::FMatrix3x3 GetReferenceToCamera() const;
 };
 
@@ -248,6 +255,9 @@ namespace LightSyncFixture
 {
     /** 内蔵プリセット */
     LIGHTSYNCDMX_API FLightSyncFixtureProfileData MakePreset(ELightSyncColorMode Mode);
+
+    /** 内蔵プリセット (一度だけ作って使い回す。毎フレームのコピーを避ける) */
+    LIGHTSYNCDMX_API const FLightSyncFixtureProfileData& GetPreset(ELightSyncColorMode Mode);
 
     /**
      * 目標色 (作業色空間のリニア、正規化照度) → DMX 値。

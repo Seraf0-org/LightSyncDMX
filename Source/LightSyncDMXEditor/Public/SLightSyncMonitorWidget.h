@@ -33,6 +33,15 @@ public:
     void Construct(const FArguments& InArgs);
     virtual void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override;
 
+    /** プローブを名前で選ぶ (コンソールコマンド用) */
+    void SelectProbeByName(const FString& ProbeName) { SelectProbe(ProbeName); }
+
+    /** 設定パネルのスクロール位置 (スクリーンショット用) */
+    void SetSettingsScrollOffset(float Offset);
+
+    /** 最後に作られたモニター (コンソールコマンド用) */
+    static TWeakPtr<SLightSyncMonitorWidget> LastInstance;
+
 private:
     // === UI構築 ===
     TSharedRef<SWidget> BuildToolbar();
@@ -74,11 +83,16 @@ private:
 
     TSharedPtr<SVerticalBox> ProbeListBox;
     TSharedPtr<SVerticalBox> SettingsPanelBox;
+    TSharedPtr<class SScrollBox> SettingsScrollBox;
 
     float MasterDimmerValue = 1.0f;
     FString SelectedProbeName;
 
     /** カメラキャリブレーション (選択プローブ用) */
     TStrongObjectPtr<ULightSyncCalibrator> Calibrator;
+
+    /** DMX / OSC 欄で編集中のフィクスチャ / 送信先 */
+    TSharedRef<int32> DMXFixtureIndex = MakeShared<int32>(0);
+    TSharedRef<int32> OSCTargetIndex = MakeShared<int32>(0);
     TSharedPtr<STextBlock> CalibrationReport;
 };

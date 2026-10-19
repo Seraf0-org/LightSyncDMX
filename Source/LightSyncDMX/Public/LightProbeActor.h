@@ -116,6 +116,14 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
     bool bIsProbeActive = true;
 
+    /**
+     * この PC が照明を送らない設定 (nDisplay の送信ノード以外など) でもキャプチャを続けるか。
+     * false (既定) なら、ゲーム中は送らない PC でキャプチャしない (描画ノードの負荷を増やさない)。
+     * 送らない PC で GetZoneColor() などの値を使うときだけ true にする。エディタのプレビューは常にキャプチャする
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings", AdvancedDisplay)
+    bool bSampleWhenNotOutputting = false;
+
     /** プローブ無効化/削除時に出力先へブラックアウトを送る (false なら最後の色を保持) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
     bool bBlackoutWhenInactive = true;
@@ -184,6 +192,24 @@ public:
     /** 全ゾーン共通の出力ゲイン (リニア)。灯体ごとの強さはフィクスチャ側で調整する */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference", meta = (ClampMin = "0.0", ClampMax = "100.0"))
     float OutputGain = 1.0f;
+
+    // === 統計 (LightSync.Stats で一覧) ===
+
+    /** 実行したキューブキャプチャ数 */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Stats")
+    int32 CapturesPerformed = 0;
+
+    /** 前回の GPU 結果待ちのため省いたキャプチャ数 (省かないと結果が使われず GPU が無駄になる) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Stats")
+    int32 CapturesSkippedBusy = 0;
+
+    /** 1 フレームのキャプチャ上限で次フレームに回した数 */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Stats")
+    int32 CapturesDeferredBudget = 0;
+
+    /** キャプチャ + ディスパッチのゲームスレッド時間の移動平均 (ms) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Stats")
+    float AvgCaptureGameThreadMs = 0.0f;
 
     /** 直近のキャプチャで使った露出倍率 (Scene モード) */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Reference")
@@ -262,6 +288,17 @@ private:
 
     /** 基準のポストプロセス (参照カメラ or 手動露出、nDisplay 選択時はレイヤーを重ねたもの) */
     FPostProcessSettings BuildReferencePostProcess();
+
+    /** キャプチャして積分に回す。前回の結果待ち / フレームの上限ならしないで false */
+    bool TryCaptureAndDispatch(bool bRespectBudget);
+
+    /** ゾーンの結果を DMX / OSC に出す */
+    void SendOutputs();
+
+    /** nDisplay の PP の合成結果のキャッシュ (リフレクションを毎サンプル回さない) */
+    FPostProcessSettings CachedNDisplayPP;
+    double CachedNDisplayTime = -1.0;
+    FString CachedNDisplayKey;
 
     /** 自動露出の警告を一度だけ出すためのフラグ */
     bool bWarnedAutoExposure = false;

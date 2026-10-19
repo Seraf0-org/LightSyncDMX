@@ -35,6 +35,9 @@ struct FLightSyncSampleContext
 
     /** キャプチャ値の伝達関数 (Wall モードは表示用にエンコード済みの値なので EOTF でデコードする) */
     ELightSyncInputTransfer InputTransfer = ELightSyncInputTransfer::Linear;
+
+    /** デコード後に掛ける補正ガンマ (壁の実際の応答カーブをキャリブレーションで合わせる。1 = 補正なし) */
+    float TransferGamma = 1.0f;
 };
 
 /**
@@ -91,6 +94,19 @@ public:
     /** CubeMapレンダーターゲットからサンプリング (結果は 1〜2 フレーム後に ZoneResults へ反映) */
     void SampleFromRenderTarget(UTextureRenderTargetCube *InCubeRT, const FLightSyncSampleContext &Context);
 
+    /** 新しいサンプルを受け付けられるか (前回の GPU 結果待ちなら false → キャプチャしても無駄になる) */
+    bool CanDispatch() const;
+
+    /** キャプチャ済みのキューブを積分に回す */
+    void Dispatch(UTextureRenderTargetCube *InCubeRT, const FLightSyncSampleContext &Context);
+
+    /** 結果が届いていれば ZoneResults に反映して true (毎フレーム呼ぶ。サンプリング間隔を待たずに出力できる) */
+    bool PollNewResult();
+
+    /** 直近の結果の遅延 (ディスパッチ → 結果, ミリ秒) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sampling|Stats")
+    float LastResultLatencyMs = 0.0f;
+
     /** 名前でゾーンの色を取得 */
     UFUNCTION(BlueprintPure, Category = "Sampling")
     bool GetZoneColor(FName ZoneName, FLinearColor &OutColor) const;
@@ -133,6 +149,10 @@ private:
     LightSyncZones::FResult LastRawResult;
     LightSyncZones::FSetup LastSetup;
     TWeakObjectPtr<UTextureRenderTargetCube> LastRenderTarget;
+
+    /** ディスパッチ時の文脈 (結果の反映に使う) と時刻 */
+    FLightSyncSampleContext PendingContext;
+    double DispatchTime = 0.0;
 
     /** 前回の結果を反映した時刻 */
     double LastResultTime = -1.0;

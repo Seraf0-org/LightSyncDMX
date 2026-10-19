@@ -162,6 +162,20 @@ namespace LightSyncFixture
         return P;
     }
 
+    const FLightSyncFixtureProfileData& GetPreset(ELightSyncColorMode Mode)
+    {
+        static const TArray<FLightSyncFixtureProfileData> Presets = []()
+        {
+            TArray<FLightSyncFixtureProfileData> All;
+            for (int32 Index = 0; Index <= static_cast<int32>(ELightSyncColorMode::CCTRGBW10CH); ++Index)
+            {
+                All.Add(MakePreset(static_cast<ELightSyncColorMode>(Index)));
+            }
+            return All;
+        }();
+        return Presets[FMath::Clamp(static_cast<int32>(Mode), 0, Presets.Num() - 1)];
+    }
+
     static void WriteLevel(TArray<uint8> &Out, const FLightSyncFixtureChannel &Channel, double Level)
     {
         uint8 Coarse = 0, Fine = 0;
