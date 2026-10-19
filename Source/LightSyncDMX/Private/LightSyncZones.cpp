@@ -362,4 +362,22 @@ namespace LightSyncZones
 
         return Zones;
     }
+
+    float RelativeChange(const TArray<FLinearColor>& A, const TArray<FLinearColor>& B, float Floor)
+    {
+        if (A.Num() != B.Num())
+        {
+            return TNumericLimits<float>::Max();
+        }
+        float MaxChange = 0.0f;
+        for (int32 Index = 0; Index < A.Num(); ++Index)
+        {
+            const FLinearColor& X = A[Index];
+            const FLinearColor& Y = B[Index];
+            const float Scale = FMath::Max3(FMath::Max3(X.R, X.G, X.B), FMath::Max3(Y.R, Y.G, Y.B), Floor);
+            const float Diff = FMath::Max3(FMath::Abs(X.R - Y.R), FMath::Abs(X.G - Y.G), FMath::Abs(X.B - Y.B));
+            MaxChange = FMath::Max(MaxChange, Diff / FMath::Max(Scale, UE_SMALL_NUMBER));
+        }
+        return MaxChange;
+    }
 }

@@ -35,10 +35,11 @@ static FAutoConsoleCommand GLightSyncStatsCommand(
             FString Reason;
             const bool bOutput = LightSyncOutput::CanOutput(Probe->GetWorld(), &Reason);
             UE_LOG(LogLightSyncDMX, Display,
-                   TEXT("LIGHTSYNC_STATS probe='%s' world=%s captures=%d skipped_busy=%d deferred_budget=%d latency_ms=%.1f gt_ms=%.3f output=%s (%s)"),
+                   TEXT("LIGHTSYNC_STATS probe='%s' world=%s captures=%d skipped_busy=%d deferred_budget=%d latency_ms=%.1f gt_ms=%.3f idle=%s idle_s=%.1f output=%s (%s)"),
                    *Probe->ProbeName, *Probe->GetWorld()->GetName(), Probe->CapturesPerformed, Probe->CapturesSkippedBusy,
                    Probe->CapturesDeferredBudget, Probe->ColorSampler ? Probe->ColorSampler->LastResultLatencyMs : 0.0f,
-                   Probe->AvgCaptureGameThreadMs, bOutput ? TEXT("yes") : TEXT("no"), *Reason);
+                   Probe->AvgCaptureGameThreadMs, Probe->bIsIdle ? TEXT("yes") : TEXT("no"), Probe->IdleSeconds,
+                   bOutput ? TEXT("yes") : TEXT("no"), *Reason);
         }
     }));
 

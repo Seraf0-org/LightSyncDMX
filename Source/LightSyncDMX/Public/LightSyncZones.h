@@ -164,4 +164,11 @@ namespace LightSyncZones
 
     /** 既定のゾーン構成 (Top / Side / Average / Key) */
     LIGHTSYNCDMX_API TArray<FLightSyncZone> MakeDefaultZones();
+
+    /**
+     * 2 つのゾーン結果の相対的な変化量 (変化の検出用)。
+     * ゾーン・チャンネルごとの |A − B| を、そのゾーンの明るい方のチャンネル最大値 (下限 Floor) で割った最大値。
+     * 数が違えば大きな値 (変化あり) を返す。Floor = 1.0 は基準白
+     */
+    LIGHTSYNCDMX_API float RelativeChange(const TArray<FLinearColor>& A, const TArray<FLinearColor>& B, float Floor = 0.01f);
 }

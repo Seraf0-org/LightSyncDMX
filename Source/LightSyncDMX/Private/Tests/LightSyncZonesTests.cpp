@@ -239,4 +239,41 @@ bool FLightSyncZonesTransferTest::RunTest(const FString &Parameters)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLightSyncZonesChangeTest, "LightSync.Zones.RelativeChangeDetectsSteps",
+                                 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::EngineFilter)
+bool FLightSyncZonesChangeTest::RunTest(const FString &Parameters)
+{
+    const TArray<FLinearColor> Base = {FLinearColor(0.5f, 0.25f, 0.1f), FLinearColor(0.0f, 0.0f, 0.0f)};
+
+    // 同じ値 → 0
+    TestEqual(TEXT("identical"), LightSyncZones::RelativeChange(Base, Base), 0.0f);
+
+    // 明るいチャンネル基準の相対変化: 0.5 → 0.505 は 1%
+    TArray<FLinearColor> Step = Base;
+    Step[0].R = 0.505f;
+    TestTrue(TEXT("1% step"), FMath::IsNearlyEqual(LightSyncZones::RelativeChange(Base, Step), 0.01f, 1e-4f));
+
+    // 暗いチャンネルの小さな変化も、ゾーンの明るさに対する割合で見る (0.1 → 0.105 は 0.5 に対して 1%)
+    Step = Base;
+    Step[0].B = 0.105f;
+    TestTrue(TEXT("dim channel relative to zone"), FMath::IsNearlyEqual(LightSyncZones::RelativeChange(Base, Step), 0.01f, 1e-4f));
+
+    // ほぼ黒のゾーンは下限 (Floor) で割る: 0 → 0.0005 は 1% の下限に対して 5%
+    Step = Base;
+    Step[1] = FLinearColor(0.0005f, 0.0f, 0.0f);
+    TestTrue(TEXT("floor"), FMath::IsNearlyEqual(LightSyncZones::RelativeChange(Base, Step, 0.01f), 0.05f, 1e-4f));
+
+    // 消灯 → 点灯は大きな変化
+    Step = Base;
+    Step[1] = FLinearColor(1.0f, 1.0f, 1.0f);
+    TestTrue(TEXT("off to on"), LightSyncZones::RelativeChange(Base, Step) >= 1.0f);
+
+    // 対称
+    TestEqual(TEXT("symmetric"), LightSyncZones::RelativeChange(Step, Base), LightSyncZones::RelativeChange(Base, Step));
+
+    // ゾーン数が違えば変化あり
+    TestTrue(TEXT("count mismatch"), LightSyncZones::RelativeChange(Base, {FLinearColor::White}) > 1.0f);
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

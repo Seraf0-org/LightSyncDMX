@@ -494,6 +494,41 @@ void SLightSyncMonitorWidget::BuildGeneralSection(ALightProbeActor* Probe)
             .Value_Lambda([W]() { return W.IsValid() ? W->SamplingRate : 30.0f; })
             .OnValueChanged_Lambda([W](float V) { MarkProbeDirty(W); if (W.IsValid()) W->SamplingRate = V; }));
 
+    // 変化がないときの更新の削減
+    AddLabeledRow(LOCTEXT("ReduceStatic", "変化がないときは更新を減らす"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+        [
+            SNew(SCheckBox)
+                .IsChecked_Lambda([W]() -> ECheckBoxState {
+                    return (W.IsValid() && W->bReduceRateWhenStatic) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+                })
+                .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                    MarkProbeDirty(W);
+                    if (W.IsValid()) W->bReduceRateWhenStatic = (S == ECheckBoxState::Checked);
+                })
+        ]
+        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(12, 0, 4, 0)
+        [
+            SNew(STextBlock).Text(LOCTEXT("IdleRate", "変化がないとき (Hz)"))
+        ]
+        + SHorizontalBox::Slot().FillWidth(1.0f)
+        [
+            SNew(SSpinBox<float>)
+                .MinValue(1.0f).MaxValue(120.0f).Delta(1.0f)
+                .IsEnabled_Lambda([W]() { return W.IsValid() && W->bReduceRateWhenStatic; })
+                .Value_Lambda([W]() { return W.IsValid() ? W->IdleSamplingRate : 5.0f; })
+                .OnValueChanged_Lambda([W](float V) { MarkProbeDirty(W); if (W.IsValid()) W->IdleSamplingRate = V; })
+        ]
+        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8, 0, 0, 0)
+        [
+            SNew(STextBlock)
+                .Text_Lambda([W]() -> FText {
+                    if (!W.IsValid() || !W->bReduceRateWhenStatic) return FText::GetEmpty();
+                    return W->bIsIdle ? LOCTEXT("IdleNow", "減らし中") : LOCTEXT("ActiveNow", "通常");
+                })
+        ]);
+
     // キャプチャ解像度
     AddLabeledRow(LOCTEXT("CaptureRes", "キャプチャ解像度"),
         SNew(SSpinBox<int32>)

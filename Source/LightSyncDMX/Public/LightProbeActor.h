@@ -211,6 +211,42 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Stats")
     float AvgCaptureGameThreadMs = 0.0f;
 
+    /** 今、変化がないため更新を減らしているか (Reduce Rate When Static) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Stats")
+    bool bIsIdle = false;
+
+    /** 更新を減らしていた合計時間 (秒) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Stats")
+    float IdleSeconds = 0.0f;
+
+    // === 変化がないときの更新の削減 ===
+
+    /**
+     * 出力がしばらく変わらないとき、キャプチャを Idle Sampling Rate まで減らす (描画の負荷を下げる)。
+     * 変化を見つけたらすぐ Sampling Rate に戻る。
+     * 代わりに、止まっている状態から光が変わったときの最初の反応が最大 1 / Idle Sampling Rate 秒遅れる。
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reduce When Static")
+    bool bReduceRateWhenStatic = false;
+
+    /** 変化がないときのサンプリングレート (Hz) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reduce When Static",
+              meta = (EditCondition = "bReduceRateWhenStatic", ClampMin = "1", ClampMax = "120"))
+    float IdleSamplingRate = 5.0f;
+
+    /**
+     * 「変化した」とみなす相対変化量 (ゾーンの明るさに対する割合。0.01 = 1%)。
+     * DMX 8bit の 1 段は約 0.4%。レンダリングのノイズ (Lumen など) で落ち着かないときは大きくする
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reduce When Static",
+              meta = (EditCondition = "bReduceRateWhenStatic", ClampMin = "0.001", ClampMax = "0.5"))
+    float IdleChangeThreshold = 0.01f;
+
+    /** 最後の変化からこの秒数たち、出力がスムージングを含めて落ち着いたら更新を減らす */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reduce When Static",
+              meta = (EditCondition = "bReduceRateWhenStatic", ClampMin = "0", ClampMax = "30", Units = "s"))
+    float IdleDelay = 1.0f;
+
     /** 直近のキャプチャで使った露出倍率 (Scene モード) */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|Reference")
     float EffectiveExposureScale = 1.0f;
@@ -258,6 +294,13 @@ private:
 
     /** サンプリングタイマー */
     float SamplingTimer = 0.0f;
+
+    /** 変化の検出: 最後に変化を見つけたときの値と時刻 */
+    TArray<FLinearColor> IdleReferenceColors;
+    double LastChangeTime = -1.0;
+
+    /** 新しい結果で変化を確認し、bIsIdle を更新する */
+    void UpdateIdleState();
 
     /** キャプチャが初期化済みか */
     bool bCaptureInitialized = false;

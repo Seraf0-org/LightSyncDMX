@@ -107,6 +107,9 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sampling|Stats")
     float LastResultLatencyMs = 0.0f;
 
+    /** 直近の結果のスムージング前の値 (ZoneResults と同じ並び。変化の検出に使う) */
+    const TArray<FLinearColor> &GetLastTargetColors() const { return LastTargetColors; }
+
     /** 名前でゾーンの色を取得 */
     UFUNCTION(BlueprintPure, Category = "Sampling")
     bool GetZoneColor(FName ZoneName, FLinearColor &OutColor) const;
@@ -159,4 +162,7 @@ private:
 
     /** 前回のゾーン名の並び (変化したらスムージングをリセット) */
     TArray<FName> LastZoneNames;
+
+    /** スムージング前の値 */
+    TArray<FLinearColor> LastTargetColors;
 };

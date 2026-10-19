@@ -144,10 +144,10 @@ void ALightProbeActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
     // 性能の診断用に統計を残す
     const float PlaySeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
     UE_LOG(LogLightSyncDMX, Log,
-           TEXT("LIGHTSYNC_STATS probe='%s' seconds=%.1f captures=%d (%.1f/s) skipped_busy=%d deferred_budget=%d latency_ms=%.1f gt_ms=%.3f"),
+           TEXT("LIGHTSYNC_STATS probe='%s' seconds=%.1f captures=%d (%.1f/s) skipped_busy=%d deferred_budget=%d latency_ms=%.1f gt_ms=%.3f idle_s=%.1f"),
            *ProbeName, PlaySeconds, CapturesPerformed, PlaySeconds > 0.0f ? CapturesPerformed / PlaySeconds : 0.0f,
            CapturesSkippedBusy, CapturesDeferredBudget, ColorSampler ? ColorSampler->LastResultLatencyMs : 0.0f,
-           AvgCaptureGameThreadMs);
+           AvgCaptureGameThreadMs, IdleSeconds);
 
     Super::EndPlay(EndPlayReason);
 
@@ -246,6 +246,15 @@ void ALightProbeActor::Tick(float DeltaTime)
     if (ColorSampler && ColorSampler->PollNewResult())
     {
         SendOutputs();
+        UpdateIdleState();
+    }
+    if (!bReduceRateWhenStatic)
+    {
+        bIsIdle = false;
+    }
+    if (bIsIdle)
+    {
+        IdleSeconds += DeltaTime;
     }
 
     // 照明を送らない PC (nDisplay の送信ノード以外など) ではキャプチャしない。描画の負荷だけが増えるため
@@ -257,7 +266,8 @@ void ALightProbeActor::Tick(float DeltaTime)
 
     // 2) サンプリングレートに基づくキャプチャ。結果待ち / フレームの上限なら次フレームに持ち越す
     SamplingTimer += DeltaTime;
-    const float SamplingInterval = 1.0f / FMath::Max(SamplingRate, 1.0f);
+    const float Rate = bIsIdle ? FMath::Min(IdleSamplingRate, SamplingRate) : SamplingRate;
+    const float SamplingInterval = 1.0f / FMath::Max(Rate, 1.0f);
     if (SamplingTimer >= SamplingInterval && TryCaptureAndDispatch(true))
     {
         SamplingTimer = FMath::Fmod(SamplingTimer, SamplingInterval);
@@ -267,6 +277,44 @@ void ALightProbeActor::Tick(float DeltaTime)
         // 持ち越し中に溜まりすぎないように 1 間隔分までにとどめる
         SamplingTimer = FMath::Min(SamplingTimer, SamplingInterval);
     }
+}
+
+void ALightProbeActor::UpdateIdleState()
+{
+    if (!bReduceRateWhenStatic || !ColorSampler)
+    {
+        bIsIdle = false;
+        LastChangeTime = -1.0;
+        IdleReferenceColors.Reset();
+        return;
+    }
+
+    const TArray<FLinearColor> &Targets = ColorSampler->GetLastTargetColors();
+    const double Now = FPlatformTime::Seconds();
+
+    // 最後に変化を見つけたときの値と比べる (前回の値と比べると、ゆっくりした変化を見逃す)
+    if (LastChangeTime < 0.0 || LightSyncZones::RelativeChange(IdleReferenceColors, Targets) > IdleChangeThreshold)
+    {
+        IdleReferenceColors = Targets;
+        LastChangeTime = Now;
+        if (bIsIdle)
+        {
+            // 減らしていた間に変化した: 次のキャプチャをすぐ行う
+            SamplingTimer = 1.0f / FMath::Max(SamplingRate, 1.0f);
+        }
+        bIsIdle = false;
+        return;
+    }
+
+    // スムージング中の出力が目標に追いつくまでは減らさない (途中の色で長く止まらないように)
+    TArray<FLinearColor> Smoothed;
+    Smoothed.Reserve(ColorSampler->ZoneResults.Num());
+    for (const FLightSyncZoneResult &Zone : ColorSampler->ZoneResults)
+    {
+        Smoothed.Add(Zone.Color);
+    }
+    const bool bSettled = LightSyncZones::RelativeChange(Smoothed, Targets) <= IdleChangeThreshold;
+    bIsIdle = bSettled && Now - LastChangeTime >= IdleDelay;
 }
 
 void ALightProbeActor::SetProbeActive(bool bActive)

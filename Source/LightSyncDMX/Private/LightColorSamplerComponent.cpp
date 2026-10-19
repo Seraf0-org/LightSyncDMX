@@ -178,6 +178,7 @@ void ULightColorSamplerComponent::ApplyNewResult(const LightSyncZones::FResult &
     {
         ZoneResults.SetNum(Active.Num());
     }
+    LastTargetColors.SetNum(Active.Num());
 
     for (int32 Index = 0; Index < Active.Num(); ++Index)
     {
@@ -191,6 +192,7 @@ void ULightColorSamplerComponent::ApplyNewResult(const LightSyncZones::FResult &
         }
         Color *= Context.ExposureScale;
         Color.A = 1.0f;
+        LastTargetColors[Index] = Color;
 
         FLightSyncZoneResult &Out = ZoneResults[Index];
         Out.Name = Active[Index].Name;
