@@ -8,10 +8,14 @@
 
 #include "Components/SceneCaptureComponentCube.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/TextureRenderTargetCube.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "LightSyncSubsystem.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/Engine.h"
+#include "Misc/App.h"
 
 ALightProbeActor::ALightProbeActor()
 {
@@ -103,6 +107,12 @@ void ALightProbeActor::OnConstruction(const FTransform &Transform)
 
 void ALightProbeActor::EnsureCaptureInitialized()
 {
+    // CDO / コマンドレット / -nullrhi (クック・ヘッドレス実行) では GPU リソースを作らない
+    if (IsTemplate() || !FApp::CanEverRender())
+    {
+        return;
+    }
+
     if (!bCaptureInitialized)
     {
         InitializeCapture();
@@ -145,9 +155,88 @@ void ALightProbeActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
     UE_LOG(LogLightSyncDMX, Log, TEXT("LightProbe '%s' stopped."), *ProbeName);
 }
 
+void ALightProbeActor::Destroyed()
+{
+    // エディタでの削除時は EndPlay が呼ばれないため、ここで消灯と登録解除を行う
+    if (bBlackoutWhenInactive)
+    {
+        BlackoutOutputs();
+    }
+
+    if (UWorld *World = GetWorld())
+    {
+        if (ULightSyncSubsystem *Subsystem = World->GetSubsystem<ULightSyncSubsystem>())
+        {
+            Subsystem->UnregisterProbe(this);
+        }
+    }
+
+    Super::Destroyed();
+}
+
+bool ALightProbeActor::ShouldSkipForPIE() const
+{
+    const UWorld *World = GetWorld();
+    if (!World || World->WorldType != EWorldType::Editor || !GEngine)
+    {
+        return false;
+    }
+
+    // PIE 実行中はエディタワールド側のプローブを止め、PIE ワールドの複製だけが送信する
+    for (const FWorldContext &Context : GEngine->GetWorldContexts())
+    {
+        if (Context.WorldType == EWorldType::PIE && Context.World() != nullptr)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ALightProbeActor::DrawDebugProbe() const
+{
+    UWorld *World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    const ULightSyncSubsystem *Subsystem = World->GetSubsystem<ULightSyncSubsystem>();
+    if (!Subsystem || !Subsystem->bDrawDebug)
+    {
+        return;
+    }
+
+    const FVector Location = GetActorLocation();
+    const FColor DrawColor = bIsProbeActive ? CorrectedOutputColor.ToFColor(true) : FColor(64, 64, 64);
+    DrawDebugSphere(World, Location, 25.0f, 16, DrawColor, false, -1.0f, SDPG_Foreground, 2.0f);
+    DrawDebugString(World, Location + FVector(0.0f, 0.0f, 40.0f),
+                    FString::Printf(TEXT("%s (%d,%d,%d)"), *ProbeName, DrawColor.R, DrawColor.G, DrawColor.B),
+                    nullptr, FColor::White, 0.0f, true);
+}
+
+void ALightProbeActor::BlackoutOutputs()
+{
+    if (bUseDMXOutput && DMXOutput)
+    {
+        DMXOutput->Blackout();
+    }
+    if (bUseOSCOutput && OSCOutput)
+    {
+        OSCOutput->Blackout();
+    }
+}
+
 void ALightProbeActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
+
+    if (ShouldSkipForPIE())
+    {
+        return;
+    }
+
+    DrawDebugProbe();
 
     if (!bIsProbeActive)
     {
@@ -169,6 +258,12 @@ void ALightProbeActor::SetProbeActive(bool bActive)
 {
     bIsProbeActive = bActive;
 
+    // 無効化した瞬間に消灯 (最後の色のまま残らないように)
+    if (!bActive && bBlackoutWhenInactive)
+    {
+        BlackoutOutputs();
+    }
+
     if (SceneCapture)
     {
         SceneCapture->SetVisibility(bActive);
@@ -182,6 +277,12 @@ void ALightProbeActor::ForceSampleOnce()
 {
     // エディタモードで呼ばれた場合に備えて遅延初期化
     EnsureCaptureInitialized();
+
+    // Blueprint / モニターから CaptureResolution が直接変更された場合に追従
+    if (CaptureRenderTarget && CaptureRenderTarget->SizeX != CaptureResolution)
+    {
+        UpdateRenderTarget();
+    }
 
     if (!SceneCapture || !CaptureRenderTarget)
     {
@@ -281,6 +382,11 @@ void ALightProbeActor::InitializeCapture()
 
 void ALightProbeActor::UpdateRenderTarget()
 {
+    if (IsTemplate() || !FApp::CanEverRender())
+    {
+        return;
+    }
+
     // 既存のレンダーターゲットがあり、解像度が一致していればスキップ
     if (CaptureRenderTarget && CaptureRenderTarget->SizeX == CaptureResolution)
     {

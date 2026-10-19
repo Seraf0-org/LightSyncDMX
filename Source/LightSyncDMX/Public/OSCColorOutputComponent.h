@@ -24,7 +24,7 @@ enum class EOSCMessageFormat : uint8
     /** /lightsync/{probename}/color [float, float, float, float] (R,G,B,A 0.0-1.0) */
     FloatRGBA UMETA(DisplayName = "Float RGBA (0.0-1.0)"),
 
-    /** QLC+ 互換: /probename/rgb  [int] (単一のRGBパック値) */
+    /** QLC+ 互換: {prefix}/{probename}/r, /g, /b  [int 0-255] (チャンネル毎に個別アドレス) */
     QLCPlusCompat UMETA(DisplayName = "QLC+ Compatible"),
 
     /** DasLight 互換: /dmx/universe/channel [int] (チャンネル毎に個別送信) */
@@ -118,6 +118,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC|Config", meta = (ClampMin = "1", ClampMax = "120"))
     float OSCSendRate = 30.0f;
 
+    /** マスターディマー (0-1)。Blackout には影響しない */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC|Config", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float MasterDimmer = 1.0f;
+
     /** バンドル送信を使うか (複数値をまとめて1パケットで送信) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC|Config")
     bool bUseBundleMessage = true;
@@ -170,15 +174,25 @@ protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent &PropertyChangedEvent) override;
+#endif
+
 private:
     /** ターゲット毎のOSCクライアント */
     UPROPERTY(Transient)
     TArray<TObjectPtr<UOSCClient>> OSCClients;
 
+    /** クライアント作成時の送信先 ("IP:Port")。Targets の変更検知に使う */
+    TArray<FString> ClientEndpoints;
+
+    /** 送信先の識別文字列 */
+    static FString MakeEndpointKey(const FOSCTargetConfig &Config);
+
     /** OSCクライアントの作成/初期化 */
     void InitializeClients();
 
-    /** OSCクライアントの遅延初期化 (エディタ/ランタイムどちらでも呼べる) */
+    /** OSCクライアントの遅延初期化。Targets の追加/削除や IP/Port 変更があれば作り直す */
     void EnsureClientsInitialized();
 
     /** OSCクライアントの破棄 */

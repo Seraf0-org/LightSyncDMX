@@ -40,6 +40,15 @@ static constexpr int32 NumColorModes = UE_ARRAY_COUNT(ColorModeNames);
 // ELightSyncColorMode に値を追加したら ColorModeNames も同時に更新すること
 static_assert(NumColorModes == 6, "ColorModeNames と ELightSyncColorMode の要素数が一致していません");
 
+// モニターからの編集をレベルの未保存変更として扱う (保存し忘れで設定が消えないように)
+static void MarkProbeDirty(const TWeakObjectPtr<ALightProbeActor>& W)
+{
+    if (W.IsValid())
+    {
+        W->MarkPackageDirty();
+    }
+}
+
 static const TCHAR* OSCFormatNames[] = {
     TEXT("Float RGB"),
     TEXT("Int RGB (0-255)"),
@@ -189,7 +198,22 @@ TSharedRef<SWidget> SLightSyncMonitorWidget::BuildToolbar()
                         {
                             Sub->SetMasterDimmer(NewValue);
                         }
-                    })]];
+                    })]]
+
+        + SHorizontalBox::Slot().AutoWidth().Padding(8.0f, 2.0f).VAlign(VAlign_Center)
+            [SNew(SCheckBox)
+                .ToolTipText(LOCTEXT("DrawDebugTip", "ビューポートに各プローブの出力色を球で表示"))
+                .IsChecked_Lambda([this]() -> ECheckBoxState {
+                    const ULightSyncSubsystem* Sub = GetSubsystem();
+                    return (Sub && Sub->bDrawDebug) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+                })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState S) {
+                    if (ULightSyncSubsystem* Sub = GetSubsystem())
+                    {
+                        Sub->bDrawDebug = (S == ECheckBoxState::Checked);
+                    }
+                })
+                [SNew(STextBlock).Text(LOCTEXT("DrawDebug", "デバッグ表示"))]];
 }
 
 // ============================================================
@@ -436,6 +460,7 @@ void SLightSyncMonitorWidget::BuildGeneralSection(ALightProbeActor* Probe)
                 return W.IsValid() ? FText::FromString(W->ProbeName) : FText::GetEmpty();
             })
             .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+                MarkProbeDirty(W);
                 if (W.IsValid()) W->ProbeName = T.ToString();
             }));
 
@@ -447,6 +472,7 @@ void SLightSyncMonitorWidget::BuildGeneralSection(ALightProbeActor* Probe)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                MarkProbeDirty(W);
                 if (W.IsValid()) W->SetProbeActive(S == ECheckBoxState::Checked);
             }));
 
@@ -455,14 +481,14 @@ void SLightSyncMonitorWidget::BuildGeneralSection(ALightProbeActor* Probe)
         SNew(SSpinBox<float>)
             .MinValue(1.0f).MaxValue(120.0f).Delta(1.0f)
             .Value_Lambda([W]() { return W.IsValid() ? W->SamplingRate : 30.0f; })
-            .OnValueChanged_Lambda([W](float V) { if (W.IsValid()) W->SamplingRate = V; }));
+            .OnValueChanged_Lambda([W](float V) { MarkProbeDirty(W); if (W.IsValid()) W->SamplingRate = V; }));
 
     // キャプチャ解像度
     AddLabeledRow(LOCTEXT("CaptureRes", "キャプチャ解像度"),
         SNew(SSpinBox<int32>)
             .MinValue(16).MaxValue(512).Delta(16)
             .Value_Lambda([W]() { return W.IsValid() ? W->CaptureResolution : 64; })
-            .OnValueChanged_Lambda([W](int32 V) { if (W.IsValid()) W->CaptureResolution = V; }));
+            .OnValueChanged_Lambda([W](int32 V) { MarkProbeDirty(W); if (W.IsValid()) W->CaptureResolution = V; }));
 
     // DMX出力トグル
     AddLabeledRow(LOCTEXT("UseDMX", "DMX出力を使用"),
@@ -472,6 +498,7 @@ void SLightSyncMonitorWidget::BuildGeneralSection(ALightProbeActor* Probe)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                MarkProbeDirty(W);
                 if (W.IsValid()) W->bUseDMXOutput = (S == ECheckBoxState::Checked);
             }));
 
@@ -483,6 +510,7 @@ void SLightSyncMonitorWidget::BuildGeneralSection(ALightProbeActor* Probe)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                MarkProbeDirty(W);
                 if (W.IsValid()) W->bUseOSCOutput = (S == ECheckBoxState::Checked);
             }));
 }
@@ -501,25 +529,25 @@ void SLightSyncMonitorWidget::BuildColorCorrectionSection(ALightProbeActor* Prob
         SNew(SSpinBox<float>)
             .MinValue(0.1f).MaxValue(5.0f).Delta(0.1f)
             .Value_Lambda([W]() { return W.IsValid() ? W->GammaCorrection : 2.2f; })
-            .OnValueChanged_Lambda([W](float V) { if (W.IsValid()) W->GammaCorrection = V; }));
+            .OnValueChanged_Lambda([W](float V) { MarkProbeDirty(W); if (W.IsValid()) W->GammaCorrection = V; }));
 
     AddLabeledRow(LOCTEXT("ColorTemp", "色温度オフセット (K)"),
         SNew(SSpinBox<float>)
             .MinValue(-3000.0f).MaxValue(3000.0f).Delta(100.0f)
             .Value_Lambda([W]() { return W.IsValid() ? W->ColorTemperatureOffset : 0.0f; })
-            .OnValueChanged_Lambda([W](float V) { if (W.IsValid()) W->ColorTemperatureOffset = V; }));
+            .OnValueChanged_Lambda([W](float V) { MarkProbeDirty(W); if (W.IsValid()) W->ColorTemperatureOffset = V; }));
 
     AddLabeledRow(LOCTEXT("Saturation", "彩度"),
         SNew(SSpinBox<float>)
             .MinValue(0.0f).MaxValue(3.0f).Delta(0.05f)
             .Value_Lambda([W]() { return W.IsValid() ? W->SaturationMultiplier : 1.0f; })
-            .OnValueChanged_Lambda([W](float V) { if (W.IsValid()) W->SaturationMultiplier = V; }));
+            .OnValueChanged_Lambda([W](float V) { MarkProbeDirty(W); if (W.IsValid()) W->SaturationMultiplier = V; }));
 
     AddLabeledRow(LOCTEXT("Brightness", "明度"),
         SNew(SSpinBox<float>)
             .MinValue(0.0f).MaxValue(3.0f).Delta(0.05f)
             .Value_Lambda([W]() { return W.IsValid() ? W->BrightnessMultiplier : 1.0f; })
-            .OnValueChanged_Lambda([W](float V) { if (W.IsValid()) W->BrightnessMultiplier = V; }));
+            .OnValueChanged_Lambda([W](float V) { MarkProbeDirty(W); if (W.IsValid()) W->BrightnessMultiplier = V; }));
 
     // 色のみモード
     AddLabeledRow(LOCTEXT("ColorOnly", "色のみモード (明度は照明側で制御)"),
@@ -529,6 +557,7 @@ void SLightSyncMonitorWidget::BuildColorCorrectionSection(ALightProbeActor* Prob
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                MarkProbeDirty(W);
                 if (W.IsValid()) W->bColorOnly = (S == ECheckBoxState::Checked);
             }));
 
@@ -536,7 +565,7 @@ void SLightSyncMonitorWidget::BuildColorCorrectionSection(ALightProbeActor* Prob
         SNew(SSpinBox<float>)
             .MinValue(0.0f).MaxValue(0.1f).Delta(0.005f)
             .Value_Lambda([W]() { return W.IsValid() ? W->ColorOnlyBlackThreshold : 0.01f; })
-            .OnValueChanged_Lambda([W](float V) { if (W.IsValid()) W->ColorOnlyBlackThreshold = V; }));
+            .OnValueChanged_Lambda([W](float V) { MarkProbeDirty(W); if (W.IsValid()) W->ColorOnlyBlackThreshold = V; }));
 
     // === 方向別カラープレビュー ===
     AddSectionHeader(LOCTEXT("SecDirectionalColors", "方向別カラープレビュー"));
@@ -637,6 +666,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput)
                     W->DMXOutput->bDMXOutputEnabled = (S == ECheckBoxState::Checked);
             }));
@@ -665,6 +695,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return FText::GetEmpty();
             })
             .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].FixtureName = T.ToString();
             }));
@@ -679,6 +710,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return 1;
             })
             .OnValueChanged_Lambda([W](int32 V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].Universe = V;
             }));
@@ -693,6 +725,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return 1;
             })
             .OnValueChanged_Lambda([W](int32 V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].StartChannel = V;
             }));
@@ -709,6 +742,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                     return 0;
                 })
                 .OnValueChanged_Lambda([W](int32 V) {
+                    MarkProbeDirty(W);
                     if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                         W->DMXOutput->FixtureMappings[0].ColorMode = static_cast<ELightSyncColorMode>(V);
                 })]
@@ -725,6 +759,29 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                     return FText::GetEmpty();
                 })]);
 
+    // 使用チャンネル範囲 (512ch を超える場合は赤で警告)
+    AddLabeledRow(LOCTEXT("ChannelRange", "使用チャンネル"),
+        SNew(STextBlock)
+            .Text_Lambda([W]() -> FText {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
+                {
+                    const FDMXFixtureMapping& M = W->DMXOutput->FixtureMappings[0];
+                    const int32 EndCh = M.StartChannel + UDMXColorOutputComponent::GetChannelCount(M.ColorMode) - 1;
+                    return FText::FromString(UDMXColorOutputComponent::IsMappingInRange(M)
+                        ? FString::Printf(TEXT("Ch %d - %d"), M.StartChannel, EndCh)
+                        : FString::Printf(TEXT("Ch %d - %d (512超え: 送信されません)"), M.StartChannel, EndCh));
+                }
+                return FText::GetEmpty();
+            })
+            .ColorAndOpacity_Lambda([W]() -> FSlateColor {
+                if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0
+                    && !UDMXColorOutputComponent::IsMappingInRange(W->DMXOutput->FixtureMappings[0]))
+                {
+                    return FSlateColor(FLinearColor(1.0f, 0.3f, 0.3f));
+                }
+                return FSlateColor::UseForeground();
+            }));
+
     // 明度スケール
     AddLabeledRow(LOCTEXT("BrightScale", "明度スケール"),
         SNew(SSpinBox<float>)
@@ -735,6 +792,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return 1.0f;
             })
             .OnValueChanged_Lambda([W](float V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].BrightnessScale = V;
             }));
@@ -749,6 +807,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return 0;
             })
             .OnValueChanged_Lambda([W](int32 V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].CCTRGBW10_GreenMagenta = V;
             }));
@@ -763,6 +822,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return 255;
             })
             .OnValueChanged_Lambda([W](int32 V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].CCTRGBW10_Crossfade = V;
             }));
@@ -777,6 +837,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return 0;
             })
             .OnValueChanged_Lambda([W](int32 V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].CCTRGBW10_Strobe = V;
             }));
@@ -791,6 +852,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return 0;
             })
             .OnValueChanged_Lambda([W](int32 V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput && W->DMXOutput->FixtureMappings.Num() > 0)
                     W->DMXOutput->FixtureMappings[0].CCTRGBW10_Reserved10 = V;
             }));
@@ -803,6 +865,7 @@ void SLightSyncMonitorWidget::BuildDMXSection(ALightProbeActor* Probe)
                 return (W.IsValid() && W->DMXOutput) ? W->DMXOutput->MasterDimmer : 1.0f;
             })
             .OnValueChanged_Lambda([W](float V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->DMXOutput) W->DMXOutput->MasterDimmer = V;
             }));
 }
@@ -834,6 +897,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput)
                     W->OSCOutput->bOSCOutputEnabled = (S == ECheckBoxState::Checked);
             }));
@@ -847,6 +911,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                     : FText::GetEmpty();
             })
             .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput)
                     W->OSCOutput->OSCProbeName = T.ToString();
             }));
@@ -859,6 +924,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                     ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             })
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput)
                     W->OSCOutput->bUseBundleMessage = (S == ECheckBoxState::Checked);
             }));
@@ -888,6 +954,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                 return ECheckBoxState::Unchecked;
             })
             .OnCheckStateChanged_Lambda([W](ECheckBoxState S) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
                     W->OSCOutput->Targets[0].bEnabled = (S == ECheckBoxState::Checked);
             }));
@@ -901,6 +968,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                 return FText::GetEmpty();
             })
             .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
                     W->OSCOutput->Targets[0].TargetName = T.ToString();
             }));
@@ -914,6 +982,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                 return FText::GetEmpty();
             })
             .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
                 {
                     W->OSCOutput->Targets[0].IPAddress = T.ToString();
@@ -931,6 +1000,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                 return 7700;
             })
             .OnValueChanged_Lambda([W](int32 V) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
                 {
                     W->OSCOutput->Targets[0].Port = V;
@@ -950,6 +1020,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                     return 0;
                 })
                 .OnValueChanged_Lambda([W](int32 V) {
+                    MarkProbeDirty(W);
                     if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
                         W->OSCOutput->Targets[0].Format = static_cast<EOSCMessageFormat>(V);
                 })]
@@ -975,6 +1046,7 @@ void SLightSyncMonitorWidget::BuildOSCSection(ALightProbeActor* Probe)
                 return FText::GetEmpty();
             })
             .OnTextCommitted_Lambda([W](const FText& T, ETextCommit::Type) {
+                MarkProbeDirty(W);
                 if (W.IsValid() && W->OSCOutput && W->OSCOutput->Targets.Num() > 0)
                     W->OSCOutput->Targets[0].AddressPrefix = T.ToString();
             }));

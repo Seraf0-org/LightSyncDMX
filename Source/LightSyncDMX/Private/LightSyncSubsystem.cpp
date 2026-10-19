@@ -209,6 +209,10 @@ void ULightSyncSubsystem::SetMasterDimmer(float Dimmer)
             {
                 Probe->DMXOutput->MasterDimmer = ClampedDimmer;
             }
+            if (Probe->OSCOutput)
+            {
+                Probe->OSCOutput->MasterDimmer = ClampedDimmer;
+            }
         }
     }
 }

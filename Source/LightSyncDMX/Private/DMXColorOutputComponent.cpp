@@ -6,6 +6,7 @@
 #include "IO/DMXOutputPort.h"
 #include "IO/DMXPortManager.h"
 #include "DMXProtocolTypes.h"
+#include "DMXProtocolConstants.h"
 #include "Library/DMXLibrary.h"
 
 UDMXColorOutputComponent::UDMXColorOutputComponent()
@@ -92,8 +93,76 @@ void UDMXColorOutputComponent::RemoveFixtureMapping(int32 Index)
     }
 }
 
+int32 UDMXColorOutputComponent::GetChannelCount(ELightSyncColorMode Mode)
+{
+    switch (Mode)
+    {
+    case ELightSyncColorMode::RGB:         return 3;
+    case ELightSyncColorMode::RGBW:        return 4;
+    case ELightSyncColorMode::RGBAW:       return 5;
+    case ELightSyncColorMode::DRGB:        return 4;
+    case ELightSyncColorMode::CCT:         return 2;
+    case ELightSyncColorMode::CCTRGBW10CH: return 10;
+    }
+    return 0;
+}
+
+bool UDMXColorOutputComponent::IsMappingInRange(const FDMXFixtureMapping &Mapping)
+{
+    const int32 LastChannel = Mapping.StartChannel + GetChannelCount(Mapping.ColorMode) - 1;
+    return Mapping.StartChannel >= 1 && LastChannel <= DMX_UNIVERSE_SIZE;
+}
+
+void UDMXColorOutputComponent::GatherOutputPorts(TArray<FDMXOutputPortSharedRef> &OutPorts)
+{
+    OutPorts.Reset();
+
+    // DMXLibrary 指定時はライブラリの出力ポートのみを使う
+    if (!DMXLibrary.IsNull())
+    {
+        if (!LoadedDMXLibrary || LoadedDMXLibrary != DMXLibrary.Get())
+        {
+            LoadedDMXLibrary = DMXLibrary.LoadSynchronous();
+        }
+
+        if (LoadedDMXLibrary)
+        {
+            OutPorts = LoadedDMXLibrary->GetOutputPorts().Array();
+            if (OutPorts.Num() > 0)
+            {
+                bWarnedLibraryNoPorts = false;
+                return;
+            }
+
+            if (!bWarnedLibraryNoPorts)
+            {
+                UE_LOG(LogLightSyncDMX, Warning,
+                       TEXT("DMXColorOutput: DMXライブラリ '%s' に出力ポートがありません。全出力ポートに送信します。"),
+                       *LoadedDMXLibrary->GetName());
+                bWarnedLibraryNoPorts = true;
+            }
+        }
+    }
+
+    OutPorts = FDMXPortManager::Get().GetOutputPorts();
+}
+
 void UDMXColorOutputComponent::SendDMXData(const FDMXFixtureMapping &Mapping, const FLinearColor &Color)
 {
+    // ユニバース (512ch) をはみ出すマッピングは送信しない (隣のユニバースや無関係なchを汚さないため)
+    if (!IsMappingInRange(Mapping))
+    {
+        if (!WarnedOutOfRangeFixtures.Contains(Mapping.FixtureName))
+        {
+            UE_LOG(LogLightSyncDMX, Warning,
+                   TEXT("DMXColorOutput: フィクスチャ '%s' は Ch%d から %dch 使用するため 512ch を超えます。送信をスキップします。"),
+                   *Mapping.FixtureName, Mapping.StartChannel, GetChannelCount(Mapping.ColorMode));
+            WarnedOutOfRangeFixtures.Add(Mapping.FixtureName);
+        }
+        return;
+    }
+    WarnedOutOfRangeFixtures.Remove(Mapping.FixtureName);
+
     // マッピングに基づいてチャンネルデータを構築
     TMap<int32, uint8> ChannelData = ColorToDMXChannels(Mapping, Color);
 
@@ -102,9 +171,8 @@ void UDMXColorOutputComponent::SendDMXData(const FDMXFixtureMapping &Mapping, co
         return;
     }
 
-    // UE 5.4: FDMXPortManager 経由で OutputPort を取得して送信
-    FDMXPortManager &PortManager = FDMXPortManager::Get();
-    const TArray<FDMXOutputPortSharedRef> &OutputPorts = PortManager.GetOutputPorts();
+    TArray<FDMXOutputPortSharedRef> OutputPorts;
+    GatherOutputPorts(OutputPorts);
 
     if (OutputPorts.Num() == 0)
     {
@@ -205,7 +273,7 @@ TMap<int32, uint8> UDMXColorOutputComponent::ColorToDMXChannels(
     {
         // 2ch: CCT (色温度), Brightness (明度)
         float CCT, Brightness;
-        RGBtoCCTBrightness(R, G, B, CCT, Brightness);
+        RGBtoCCTBrightness(Mapping, R, G, B, CCT, Brightness);
         Channels.Add(Ch + 0, FloatToByte(CCT));
         Channels.Add(Ch + 1, FloatToByte(Brightness));
         break;
@@ -214,7 +282,7 @@ TMap<int32, uint8> UDMXColorOutputComponent::ColorToDMXChannels(
     case ELightSyncColorMode::CCTRGBW10CH:
     {
         // 10ch: CCT & RGBW 8bit
-        // Ch1: CCT(2700K-7500K)
+        // Ch1: CCT (CCTMinKelvin - CCTMaxKelvin)
         // Ch2: Green/Magenta
         // Ch3: Dimmer
         // Ch4: Crossfade (CCT -> RGBW)
@@ -223,7 +291,7 @@ TMap<int32, uint8> UDMXColorOutputComponent::ColorToDMXChannels(
         // Ch10: Reserved
 
         float CCT, Brightness;
-        RGBtoCCTBrightness(R, G, B, CCT, Brightness);
+        RGBtoCCTBrightness(Mapping, R, G, B, CCT, Brightness);
 
         float OutR, OutG, OutB, OutW;
         RGBtoRGBW(R, G, B, OutR, OutG, OutB, OutW);
@@ -257,27 +325,55 @@ void UDMXColorOutputComponent::RGBtoRGBW(float R, float G, float B,
     OutB = B - OutW;
 }
 
-void UDMXColorOutputComponent::RGBtoCCTBrightness(float R, float G, float B,
+void UDMXColorOutputComponent::RGBtoCCTBrightness(const FDMXFixtureMapping &Mapping,
+                                                  float R, float G, float B,
                                                   float &OutCCT, float &OutBrightness) const
 {
-    // McCamy's approximation を使用したRGB→CCT変換の簡易版
-    // 実際の照明機器は 2700K (暖色) ～ 6500K (昼光色) 程度
+    // リニアsRGB → CIE XYZ → xy色度 → McCamy の近似式で相関色温度を求め、
+    // 灯体の CCT レンジ (CCTMinKelvin - CCTMaxKelvin) で 0-1 に正規化する。
 
     OutBrightness = FMath::Max3(R, G, B);
 
+    const float MinK = FMath::Min(Mapping.CCTMinKelvin, Mapping.CCTMaxKelvin);
+    const float MaxK = FMath::Max(Mapping.CCTMinKelvin, Mapping.CCTMaxKelvin);
+    const float MidK = 0.5f * (MinK + MaxK);
+
+    auto NormalizeKelvin = [MinK, MaxK](float Kelvin) -> float
+    {
+        return (MaxK - MinK) > 1.0f ? FMath::Clamp((Kelvin - MinK) / (MaxK - MinK), 0.0f, 1.0f) : 0.5f;
+    };
+
     if (OutBrightness < 0.001f)
     {
-        OutCCT = 0.5f; // デフォルト: 中間色温度
+        OutCCT = NormalizeKelvin(MidK); // デフォルト: 中間色温度
         OutBrightness = 0.0f;
         return;
     }
 
-    // 正規化
-    float NR = R / OutBrightness;
-    float NB = B / OutBrightness;
+    const float X = 0.4124f * R + 0.3576f * G + 0.1805f * B;
+    const float Y = 0.2126f * R + 0.7152f * G + 0.0722f * B;
+    const float Z = 0.0193f * R + 0.1192f * G + 0.9505f * B;
+    const float Sum = X + Y + Z;
 
-    // Blue/Red 比率で色温度を推定
-    // 0.0 = 暖色 (2700K), 1.0 = 昼光色 (6500K)
-    float Ratio = FMath::Clamp(NB / FMath::Max(NR, 0.001f), 0.0f, 2.0f);
-    OutCCT = FMath::Clamp(Ratio / 2.0f, 0.0f, 1.0f);
+    if (Sum < KINDA_SMALL_NUMBER)
+    {
+        OutCCT = NormalizeKelvin(MidK);
+        return;
+    }
+
+    const float x = X / Sum;
+    const float y = Y / Sum;
+    const float Denom = 0.1858f - y;
+    if (FMath::Abs(Denom) < KINDA_SMALL_NUMBER)
+    {
+        OutCCT = NormalizeKelvin(MidK);
+        return;
+    }
+
+    // McCamy (1992)。黒体軌跡から大きく外れる飽和色では値が発散するので範囲を制限する
+    const float n = (x - 0.3320f) / Denom;
+    const float Kelvin = FMath::Clamp(449.0f * n * n * n + 3525.0f * n * n + 6823.3f * n + 5520.33f,
+                                      1000.0f, 40000.0f);
+
+    OutCCT = NormalizeKelvin(Kelvin);
 }

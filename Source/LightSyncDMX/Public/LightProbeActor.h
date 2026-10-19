@@ -99,6 +99,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
     bool bIsProbeActive = true;
 
+    /** プローブ無効化/削除時に出力先へブラックアウトを送る (false なら最後の色を保持) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
+    bool bBlackoutWhenInactive = true;
+
     /** プローブ名 (識別用) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Settings")
     FString ProbeName = TEXT("LightProbe_01");
@@ -200,6 +204,7 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Tick(float DeltaTime) override;
     virtual void OnConstruction(const FTransform &Transform) override;
+    virtual void Destroyed() override;
 
     /** エディタ(非PIE)でもTickを有効にする */
     virtual bool ShouldTickIfViewportsOnly() const override;
@@ -227,6 +232,15 @@ private:
 
     /** レンダーターゲットを作成/更新 */
     void UpdateRenderTarget();
+
+    /** 使用中の出力 (DMX/OSC) にブラックアウトを送る */
+    void BlackoutOutputs();
+
+    /** エディタワールドのプローブが PIE 中に二重送信しないよう判定 */
+    bool ShouldSkipForPIE() const;
+
+    /** サブシステムのデバッグ描画 */
+    void DrawDebugProbe() const;
 
     /** 色補正を適用 */
     FLinearColor ApplyColorCorrection(const FLinearColor &RawColor) const;

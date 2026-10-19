@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "DMXProtocolCommon.h"
 #include "DMXColorOutputComponent.generated.h"
 
 class UDMXLibrary;
@@ -62,6 +63,14 @@ struct LIGHTSYNCDMX_API FDMXFixtureMapping
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX", meta = (ClampMin = "0.0", ClampMax = "2.0"))
     float BrightnessScale = 1.0f;
 
+    /** CCTチャンネル値 0 に対応する色温度 (K) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCT", meta = (ClampMin = "1000", ClampMax = "20000", EditCondition = "ColorMode==ELightSyncColorMode::CCT || ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
+    float CCTMinKelvin = 2700.0f;
+
+    /** CCTチャンネル値 255 に対応する色温度 (K) - 灯体の仕様に合わせる (例: 10ch灯体は 7500K が多い) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCT", meta = (ClampMin = "1000", ClampMax = "20000", EditCondition = "ColorMode==ELightSyncColorMode::CCT || ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
+    float CCTMaxKelvin = 6500.0f;
+
     /** 10chモード: Ch2 Green/Magenta 制御値 (0-255, 0=Neutral/No Effect) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|CCTRGBW10ch", meta = (ClampMin = "0", ClampMax = "255", EditCondition = "ColorMode==ELightSyncColorMode::CCTRGBW10CH"))
     int32 CCTRGBW10_GreenMagenta = 0;
@@ -96,7 +105,10 @@ public:
 
     // === 設定 ===
 
-    /** DMXライブラリへの参照 */
+    /**
+     * DMXライブラリへの参照 (任意)。
+     * 設定した場合はライブラリの Output Ports のみに送信する。未設定なら Project Settings の全出力ポートに送信。
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DMX|Config")
     TSoftObjectPtr<UDMXLibrary> DMXLibrary;
 
@@ -142,6 +154,17 @@ public:
     UFUNCTION(BlueprintCallable, Category = "DMX")
     void RemoveFixtureMapping(int32 Index);
 
+    /** カラーモードが使用するチャンネル数 */
+    UFUNCTION(BlueprintPure, Category = "DMX")
+    static int32 GetChannelCount(ELightSyncColorMode Mode);
+
+    /** マッピングがユニバース内 (1-512) に収まっているか */
+    UFUNCTION(BlueprintPure, Category = "DMX")
+    static bool IsMappingInRange(const FDMXFixtureMapping &Mapping);
+
+    /** FLinearColorからDMXチャンネル値 (絶対チャンネル番号 → 値) へ変換。MasterDimmer / BrightnessScale 適用済み */
+    TMap<int32, uint8> ColorToDMXChannels(const FDMXFixtureMapping &Mapping, const FLinearColor &Color) const;
+
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -150,15 +173,25 @@ private:
     /** 色をDMXチャンネル値に変換して送信 */
     void SendDMXData(const FDMXFixtureMapping &Mapping, const FLinearColor &Color);
 
-    /** FLinearColorからDMXバイト配列へ変換 */
-    TMap<int32, uint8> ColorToDMXChannels(const FDMXFixtureMapping &Mapping, const FLinearColor &Color) const;
-
     /** RGB → RGBW 変換 */
     void RGBtoRGBW(float R, float G, float B, float &OutR, float &OutG, float &OutB, float &OutW) const;
 
-    /** RGB → 色温度(CCT) + 明度 変換 */
-    void RGBtoCCTBrightness(float R, float G, float B, float &OutCCT, float &OutBrightness) const;
+    /** RGB → 色温度(CCT, Min-Max を 0-1 に正規化) + 明度 変換 */
+    void RGBtoCCTBrightness(const FDMXFixtureMapping &Mapping, float R, float G, float B, float &OutCCT, float &OutBrightness) const;
+
+    /** 送信先の出力ポートを取得 (DMXLibrary 指定時はそのポートのみ) */
+    void GatherOutputPorts(TArray<FDMXOutputPortSharedRef> &OutPorts);
+
+    /** ロード済みの DMXLibrary (TSoftObjectPtr の毎フレーム解決を避ける) */
+    UPROPERTY(Transient)
+    TObjectPtr<UDMXLibrary> LoadedDMXLibrary;
 
     /** DMX出力ポート未設定警告を一度だけ出すためのフラグ */
     bool bWarnedNoOutputPorts = false;
+
+    /** DMXLibrary に出力ポートが無い警告を一度だけ出すためのフラグ */
+    bool bWarnedLibraryNoPorts = false;
+
+    /** 範囲外 (512ch超え) 警告済みのフィクスチャ名 */
+    TSet<FString> WarnedOutOfRangeFixtures;
 };

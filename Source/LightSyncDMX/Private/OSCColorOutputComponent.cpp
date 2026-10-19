@@ -35,6 +35,11 @@ void UOSCColorOutputComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
     Super::EndPlay(EndPlayReason);
 }
 
+FString UOSCColorOutputComponent::MakeEndpointKey(const FOSCTargetConfig &Config)
+{
+    return FString::Printf(TEXT("%s:%d"), *Config.IPAddress.TrimStartAndEnd(), Config.Port);
+}
+
 void UOSCColorOutputComponent::InitializeClients()
 {
     DestroyClients();
@@ -43,20 +48,17 @@ void UOSCColorOutputComponent::InitializeClients()
     {
         const FOSCTargetConfig &Config = Targets[i];
 
-        if (!Config.bEnabled)
-        {
-            OSCClients.Add(nullptr);
-            continue;
-        }
-
-        // UOSCClient を動的に生成
+        // 無効なターゲットもクライアントは作っておく (後から有効化したときに再接続不要にするため)
+        // 名前は一意にする (同名で NewObject すると破棄待ちの旧クライアントを上書きしてしまう)
+        const FString IPAddress = Config.IPAddress.TrimStartAndEnd();
         UOSCClient *Client = UOSCManager::CreateOSCClient(
-            Config.IPAddress,
+            IPAddress,
             Config.Port,
-            FString::Printf(TEXT("LightSync_OSC_%d"), i),
+            MakeUniqueObjectName(this, UOSCClient::StaticClass(), *FString::Printf(TEXT("LightSync_OSC_%d"), i)).ToString(),
             this);
 
-        if (Client)
+        // CreateOSCClient は送信先の解析失敗を戻り値で返さないので、ここで再設定して判定する
+        if (Client && Client->SetSendIPAddress(IPAddress, Config.Port))
         {
             OSCClients.Add(Client);
             UE_LOG(LogLightSyncDMX, Log, TEXT("OSC Client created: '%s' -> %s:%d"),
@@ -66,9 +68,11 @@ void UOSCColorOutputComponent::InitializeClients()
         {
             OSCClients.Add(nullptr);
             UE_LOG(LogLightSyncDMX, Warning,
-                   TEXT("Failed to create OSC Client for target '%s' (%s:%d)"),
+                   TEXT("Failed to create OSC Client for target '%s' (%s:%d). IPアドレスを確認してください。"),
                    *Config.TargetName, *Config.IPAddress, Config.Port);
         }
+
+        ClientEndpoints.Add(MakeEndpointKey(Config));
     }
 
     // 有効なクライアントが1つ以上あるときだけ接続済みとみなす
@@ -77,7 +81,9 @@ void UOSCColorOutputComponent::InitializeClients()
 
 void UOSCColorOutputComponent::DestroyClients()
 {
+    // UOSCClient::Stop は protected。参照を外せば GC 時にソケットが閉じられる
     OSCClients.Empty();
+    ClientEndpoints.Empty();
     bIsConnected = false;
 }
 
@@ -99,13 +105,16 @@ void UOSCColorOutputComponent::SendColor(const FLinearColor &Color)
     }
 
     LastOSCSendTimeSeconds = NowSeconds;
-    LastSentColor = Color;
+
+    FLinearColor DimmedColor = Color * FMath::Clamp(MasterDimmer, 0.0f, 1.0f);
+    DimmedColor.A = Color.A;
+    LastSentColor = DimmedColor;
 
     for (int32 i = 0; i < Targets.Num(); ++i)
     {
         if (Targets[i].bEnabled)
         {
-            SendToTarget(i, Color);
+            SendToTarget(i, DimmedColor);
         }
     }
 
@@ -119,9 +128,13 @@ void UOSCColorOutputComponent::SendColorToTarget(const FLinearColor &Color, int3
         return;
     }
 
+    EnsureClientsInitialized();
+
     if (Targets[TargetIndex].bEnabled)
     {
-        SendToTarget(TargetIndex, Color);
+        FLinearColor DimmedColor = Color * FMath::Clamp(MasterDimmer, 0.0f, 1.0f);
+        DimmedColor.A = Color.A;
+        SendToTarget(TargetIndex, DimmedColor);
     }
 }
 
@@ -350,6 +363,8 @@ void UOSCColorOutputComponent::SendDasLightFormat(
 
 void UOSCColorOutputComponent::SendCustomOSCFloat(const FString &Address, float Value)
 {
+    EnsureClientsInitialized();
+
     for (int32 i = 0; i < OSCClients.Num(); ++i)
     {
         if (OSCClients[i] && Targets.IsValidIndex(i) && Targets[i].bEnabled)
@@ -364,6 +379,8 @@ void UOSCColorOutputComponent::SendCustomOSCFloat(const FString &Address, float 
 
 void UOSCColorOutputComponent::SendCustomOSCInt(const FString &Address, int32 Value)
 {
+    EnsureClientsInitialized();
+
     for (int32 i = 0; i < OSCClients.Num(); ++i)
     {
         if (OSCClients[i] && Targets.IsValidIndex(i) && Targets[i].bEnabled)
@@ -407,9 +424,28 @@ void UOSCColorOutputComponent::ReconnectAll()
 
 void UOSCColorOutputComponent::EnsureClientsInitialized()
 {
-    // クライアントが未作成でターゲットがある場合に初期化
-    if (OSCClients.Num() == 0 && Targets.Num() > 0)
+    // ターゲット数や送信先が変わっていれば作り直す (エディタ/Blueprintからの直接編集に追従)
+    bool bNeedsRebuild = (OSCClients.Num() != Targets.Num()) || (ClientEndpoints.Num() != Targets.Num());
+    for (int32 i = 0; !bNeedsRebuild && i < Targets.Num(); ++i)
+    {
+        bNeedsRebuild = (ClientEndpoints[i] != MakeEndpointKey(Targets[i]));
+    }
+
+    if (bNeedsRebuild)
     {
         InitializeClients();
     }
 }
+
+#if WITH_EDITOR
+void UOSCColorOutputComponent::PostEditChangeProperty(FPropertyChangedEvent &PropertyChangedEvent)
+{
+    Super::PostEditChangeProperty(PropertyChangedEvent);
+
+    const FName MemberName = PropertyChangedEvent.GetMemberPropertyName();
+    if (MemberName == GET_MEMBER_NAME_CHECKED(UOSCColorOutputComponent, Targets))
+    {
+        ReconnectAll();
+    }
+}
+#endif

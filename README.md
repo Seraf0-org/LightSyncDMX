@@ -61,6 +61,8 @@ UEシーンの光源
 - 色補正機能 (ガンマ、色温度、彩度、明度)
 - **方向別カラー出力**: Average / Top / Side / Dominant から選択可能
 - エディタ上で視覚的にプローブ位置を確認可能
+- 無効化・削除時に出力先へブラックアウトを送信 (`Blackout When Inactive`、オフにすると最後の色を保持)
+- PIE 実行中はエディタ側のプローブが送信を止め、PIE 側だけが送信する (二重送信によるちらつき防止)
 
 ### LightColorSamplerComponent
 - CubeMapレンダーターゲットからピクセルデータを読み取り
@@ -73,8 +75,10 @@ UEシーンの光源
 ### DMXColorOutputComponent
 - UE DMXProtocol プラグインを使用してArt-Net / sACN で送信
 - 複数のフィクスチャへの同時出力対応
-- カラーモード: RGB, RGBW, RGBAW, Dimmer+RGB, CCT+Brightness
+- カラーモード: RGB, RGBW, RGBAW, Dimmer+RGB, CCT+Brightness, CCT & RGBW (10ch)
 - フィクスチャ毎の個別ブライトネス調整
+- **DMX Library** を指定するとそのライブラリの Output Ports にだけ送信 (未指定なら Project Settings の全出力ポート)
+- 開始チャンネル + 使用ch数 が 512 を超えるマッピングは送信せず警告 (モニターでも赤表示)
 
 ### OSCColorOutputComponent (★ 別PC連携)
 - **ネットワーク経由** で別PCの照明ソフトに色データを送信
@@ -83,17 +87,21 @@ UEシーンの光源
 - 汎用 Float RGB / Int RGB255 / RGBA / カスタムアドレス
 - 複数ターゲットへの同時送信対応 (異なるPCに同時送信可)
 - バンドルメッセージ対応 (R/G/Bを1パケットにまとめて送信)
+- 送信先 (IP / Port) を Details やモニターで変更すると自動で再接続
+- マスターディマー対応 (Blackout には影響しない)
 
 ### LightSyncSubsystem
 - ワールド内の全プローブを一括管理
-- マスターディマー、一括ON/OFF、ブラックアウト
+- マスターディマー (DMX / OSC 両方に適用)、一括ON/OFF、ブラックアウト
+- `bDrawDebug`: 各プローブ位置に出力色の球と名前を描画
 - Blueprint/C++ から統一的にアクセス可能
 
 ### LightSyncDMXEditor (Editor Module)
 - **LightSync DMX Monitor** ウィンドウ: Window → Virtual Production → LightSync DMX Monitor
 - リアルタイムでプローブ状態、色、DMXチャンネルを確認
 - **方向別カラープレビュー**: Average / Top / Side / Dominant を並列表示
-- マスターコントロール (一括有効/無効、ブラックアウト、ディマー)
+- マスターコントロール (一括有効/無効、ブラックアウト、ディマー、デバッグ表示)
+- モニターで変更した値はレベルの未保存変更になるので、Ctrl+S でレベルと一緒に保存される
 
 ---
 
@@ -135,8 +143,7 @@ UEシーンの光源
 - Universe と Start Channel を DasLight の設定と一致させる
 
 ### 3. プローブの配置
-1. Content Browser → LightSyncDMX → Place in Level
-   または Place Actors パネルから "Light Probe (DMX)" を検索して配置
+1. Place Actors パネルで "Light Probe (DMX)" を検索してレベルに配置
 2. プローブの Details パネルで設定:
    - **Probe Name**: 識別名
    - **Capture Resolution**: キャプチャ解像度 (64推奨)
@@ -149,6 +156,8 @@ UEシーンの光源
    - **Start Channel**: 開始チャンネル
    - **Color Mode**: 照明器具に合わせたモード
    - **Brightness Scale**: 個別の明度調整
+   - **CCT Min / Max Kelvin**: CCT系モードで ch値 0 / 255 に対応する色温度 (灯体のマニュアルに合わせる)
+3. 特定のポートだけに送りたい場合は DMX Output → **DMX Library** にライブラリを指定
 
 ### 5. 色補正
 1. LightProbeActor の Color セクション:
@@ -206,6 +215,11 @@ LightSyncBPLibrary::DMXValuesToLinearColor(R, G, B)
 | RGBAW | 5 | R, G, B, Amber, White |
 | Dimmer+RGB | 4 | Dimmer, R, G, B |
 | CCT+Brightness | 2 | 色温度, 明度 |
+| CCT & RGBW (10ch) | 10 | CCT, Green/Magenta, Dimmer, Crossfade, R, G, B, W, Strobe, Reserved |
+
+CCT 値はリニアRGB → CIE xy → McCamy 近似で色温度を求め、マッピングの **CCT Min / Max Kelvin**
+(既定 2700K–6500K) で 0–255 に割り当てます。10ch モードの Green/Magenta・Crossfade・Strobe・Reserved は
+マッピングに設定した固定値を送ります。
 
 ---
 
@@ -233,6 +247,9 @@ VP撮影では、照明の位置によって異なる色が必要になること
 LightSyncDMX/
 ├── LightSyncDMX.uplugin
 ├── README.md
+├── BuildPlugin.bat                    (配布用パッケージビルド)
+├── Config/FilterPlugin.ini
+├── Resources/Icon128.png              (プラグインアイコン)
 ├── Shaders/                           (GPU Compute Shaders)
 │   └── Private/
 │       └── LightSyncAverageCS.usf
@@ -318,6 +335,17 @@ LightSyncDMX/
      ```
 
 ---
+
+## トラブルシューティング
+
+| 症状 | 確認すること |
+|------|-------------|
+| DMX が出ない / ログに「DMX出力ポートが設定されていません」 | Project Settings → Plugins → DMX → Output Ports にポートを追加。DMX Library 指定時はライブラリ側の Output Ports も確認 |
+| ログに「512ch を超えます」 | Start Channel を下げる。モニターの「使用チャンネル」で範囲を確認 |
+| OSC が届かない | IP / Port、受信側ファイアウォール (UDP)、`Use OSC Output` と各 Target の `Enabled` |
+| PIE 中にエディタ側プローブの色が止まる | 仕様。PIE ワールドのプローブだけが送信する |
+| プローブを止めると照明が消える | 仕様。最後の色を残すなら `Blackout When Inactive` をオフ |
+| エディタ / ゲーム終了時に照明が最後の色のまま残る | UE の DMX 出力ポートはエンジン終了要求後に送信を止めるため、終了処理中のブラックアウトは Art-Net / sACN に届かない (OSC は届く)。PIE の停止では届く。終了前に `BlackoutAllProbes` を呼んで1フレーム以上待つか、照明卓側で信号断時の動作を設定する |
 
 ## パッケージビルド方法 (配布者向け)
 

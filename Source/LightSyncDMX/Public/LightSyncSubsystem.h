@@ -21,10 +21,10 @@ struct LIGHTSYNCDMX_API FLightSyncProbeInfo
     FString ProbeName;
 
     UPROPERTY(BlueprintReadOnly, Category = "LightSync")
-    FVector Location;
+    FVector Location = FVector::ZeroVector;
 
     UPROPERTY(BlueprintReadOnly, Category = "LightSync")
-    FLinearColor CurrentColor;
+    FLinearColor CurrentColor = FLinearColor::Black;
 
     UPROPERTY(BlueprintReadOnly, Category = "LightSync")
     bool bIsActive = false;
@@ -89,13 +89,13 @@ public:
     UFUNCTION(BlueprintCallable, Category = "LightSync")
     void ForceSampleAll();
 
-    /** マスターディマーを全プローブに設定 */
+    /** マスターディマーを全プローブの DMX / OSC 出力に設定 */
     UFUNCTION(BlueprintCallable, Category = "LightSync")
     void SetMasterDimmer(float Dimmer);
 
     // === デバッグ ===
 
-    /** デバッグ描画を有効/無効 */
+    /** デバッグ描画を有効/無効 (各プローブ位置に出力色の球と名前を描く) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightSync|Debug")
     bool bDrawDebug = false;
 
