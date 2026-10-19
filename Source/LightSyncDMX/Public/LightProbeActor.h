@@ -6,6 +6,7 @@
 #include "GameFramework/Actor.h"
 #include "Engine/Scene.h"
 #include "LightColorSamplerComponent.h"
+#include "OpenColorIOColorSpace.h"
 #include "LightProbeActor.generated.h"
 
 class ULightColorSamplerComponent;
@@ -13,6 +14,7 @@ class UDMXColorOutputComponent;
 class UOSCColorOutputComponent;
 class USceneCaptureComponentCube;
 class UTextureRenderTargetCube;
+class UTextureRenderTarget2D;
 class UStaticMeshComponent;
 class UBillboardComponent;
 
@@ -32,6 +34,20 @@ enum class ELightSyncReferenceMode : uint8
      * トーンマップ前の放射輝度を、参照カメラ (または手動) の露出だけで正規化する。
      */
     Scene UMETA(DisplayName = "Scene Light (Scene-Referred)"),
+};
+
+/** Wall モードで、壁へ送る信号に掛かる OCIO をどこから取るか */
+UENUM(BlueprintType)
+enum class ELightSyncOCIOSource : uint8
+{
+    /** Post Process Source が nDisplay なら、nDisplay が外側ビューポートに掛ける OCIO を使う。それ以外は掛けない */
+    Auto UMETA(DisplayName = "Auto (nDisplay)"),
+
+    /** プローブの OCIO Settings を使う (OCIO を掛けたビューポートから壁へ送っている場合など) */
+    Manual UMETA(DisplayName = "Manual"),
+
+    /** OCIO を掛けない */
+    Off UMETA(DisplayName = "Off"),
 };
 
 /** ポストプロセス (露出・グレーディング・トーンカーブ) をどこから取るか */
@@ -189,6 +205,47 @@ public:
               meta = (EditCondition = "ReferenceMode == ELightSyncReferenceMode::Wall"))
     ELightSyncInputTransfer WallDisplayEOTF = ELightSyncInputTransfer::SRGB;
 
+    /** Wall Display EOTF = Gamma (Custom) のときのガンマ (例: 2.35) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference",
+              meta = (EditCondition = "ReferenceMode == ELightSyncReferenceMode::Wall && WallDisplayEOTF == ELightSyncInputTransfer::Gamma",
+                      ClampMin = "1.0", ClampMax = "4.0"))
+    float WallGamma = 2.2f;
+
+    /**
+     * Wall Display EOTF = PQ のとき、正規化値 1.0 とする明るさ (nits)。
+     * OCIO の構成がシーン値 1.0 を何 nits に割り当てているかに合わせる (UE 同梱の例は 100 nits)
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference",
+              meta = (EditCondition = "ReferenceMode == ELightSyncReferenceMode::Wall && WallDisplayEOTF == ELightSyncInputTransfer::PQ",
+                      ClampMin = "1", ClampMax = "10000", Units = "nits"))
+    float PQReferenceWhiteNits = 100.0f;
+
+    /**
+     * Wall モード: 壁へ送る信号に掛かる OCIO。
+     * OCIO を掛けると、壁の信号は「トーンカーブなしのリニア値 (露出・グレーディング後) → OCIO」になる。
+     * プローブも同じ OCIO を同じシェーダーで掛け、Wall Display EOTF でデコードしてから積分する。
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|OCIO",
+              meta = (EditCondition = "ReferenceMode == ELightSyncReferenceMode::Wall"))
+    ELightSyncOCIOSource OCIOSource = ELightSyncOCIOSource::Auto;
+
+    /** OCIO Source = Manual のときの OCIO の変換 (変換先は壁の表示用の色空間 / Display-View) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|OCIO",
+              meta = (EditCondition = "ReferenceMode == ELightSyncReferenceMode::Wall && OCIOSource == ELightSyncOCIOSource::Manual"))
+    FOpenColorIOColorConversionSettings OCIOSettings;
+
+    /**
+     * OCIO の出力 (Wall Display EOTF でデコードした後) の色域。
+     * 変換先の Display-View に合わせる (sRGB / Rec.709 系、P3-D65、Rec.2100 / Rec.2020 系)
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|OCIO",
+              meta = (EditCondition = "ReferenceMode == ELightSyncReferenceMode::Wall && OCIOSource != ELightSyncOCIOSource::Off"))
+    ELightSyncDisplayGamut OCIODisplayGamut = ELightSyncDisplayGamut::Rec709;
+
+    /** 直近のキャプチャで使った OCIO (診断用) */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "LightProbe|OCIO")
+    FString OCIOReport;
+
     /** 全ゾーン共通の出力ゲイン (リニア)。灯体ごとの強さはフィクスチャ側で調整する */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LightProbe|Reference", meta = (ClampMin = "0.0", ClampMax = "100.0"))
     float OutputGain = 1.0f;
@@ -342,6 +399,24 @@ private:
     FPostProcessSettings CachedNDisplayPP;
     double CachedNDisplayTime = -1.0;
     FString CachedNDisplayKey;
+
+    /** nDisplay の OCIO (PP と同じく 0.25 秒ごとに読み直す) */
+    FOpenColorIOColorConversionSettings CachedNDisplayOCIO;
+    bool bCachedNDisplayHasOCIO = false;
+    FString CachedNDisplayOCIOReport;
+
+    /** OCIO 後の 6 面アトラス (6N × N, RGBA16F) */
+    UPROPERTY(Transient)
+    TObjectPtr<UTextureRenderTarget2D> OCIOAtlas;
+
+    /** OCIO は設定されているが、シェーダーの準備がまだ (このキャプチャは見送る) */
+    bool bOCIOPending = false;
+
+    /** 掛ける OCIO を決める (なければ nullptr) */
+    const FOpenColorIOColorConversionSettings* ResolveOCIO();
+
+    /** アトラスを用意する */
+    UTextureRenderTarget2D* EnsureOCIOAtlas();
 
     /** 自動露出の警告を一度だけ出すためのフラグ */
     bool bWarnedAutoExposure = false;

@@ -6,7 +6,9 @@
 #include "LightSyncZones.h"
 
 class UTextureRenderTargetCube;
+class UTextureRenderTarget2D;
 class FRHIGPUBufferReadback; // RHIGPUReadback.h をインクルードするのは .cpp 側
+struct FLightSyncOCIOPass;
 
 /**
  * FLightSyncGPUSampler
@@ -32,8 +34,11 @@ public:
     void SetForceCPUSync(bool bInForceCPUSync);
     bool IsInitialized() const { return bInitialized; }
 
-    /** キューブマップの積分を GPU (or CPU) にディスパッチ */
-    void DispatchSampling(UTextureRenderTargetCube* CubeRT);
+    /**
+     * キューブマップの積分を GPU (or CPU) にディスパッチ。
+     * OCIO が有効なら、先に 6 面のアトラスへ並べて OCIO を掛け、そのアトラスを積分する
+     */
+    void DispatchSampling(UTextureRenderTargetCube* CubeRT, const FLightSyncOCIOPass* OCIO = nullptr);
 
     /** 前回の GPU 積分の結果待ちか (待っている間にキャプチャしても使われない) */
     bool IsBusy() const { return bInitialized && !ShouldUseCPUPath() && bDispatched; }
@@ -49,6 +54,9 @@ public:
 
     /** CPU でキューブマップを読み出す (検証用。ゲームスレッドで同期読み出しするので重い) */
     static bool ReadCubeTexels(UTextureRenderTargetCube* CubeRT, TArray<FLinearColor> (&OutFaces)[6], int32& OutSize);
+
+    /** OCIO 後の 6 面アトラス (6N × N) を面ごとに読み出す (検証用) */
+    static bool ReadAtlasTexels(UTextureRenderTarget2D* AtlasRT, TArray<FLinearColor> (&OutFaces)[6], int32& OutSize);
 
     /**
      * GPU の出力バッファのレイアウト (LightSyncAverageCS.usf と一致させる):
@@ -93,7 +101,7 @@ private:
     TSharedPtr<FReadbackSharedState, ESPMode::ThreadSafe> ReadbackState;
     int32 InFlightNumZones = 0;
 
-    void ComputeCPU(UTextureRenderTargetCube* CubeRT);
+    void ComputeCPU(UTextureRenderTargetCube* CubeRT, const FLightSyncOCIOPass* OCIO);
 
     bool ShouldUseCPUPath() const { return bForceCPUSync || !bGPUPathAvailable; }
 };

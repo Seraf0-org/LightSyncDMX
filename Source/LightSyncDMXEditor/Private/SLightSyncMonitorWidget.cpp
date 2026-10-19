@@ -612,6 +612,67 @@ void SLightSyncMonitorWidget::BuildReferenceSection(ALightProbeActor* Probe)
                 return W->NDisplayReport.IsEmpty() ? LOCTEXT("NDisplayNone", "(なし)") : FText::FromString(W->NDisplayReport.TrimEnd());
             }));
 
+    // 壁の表示特性 (EOTF) と、PQ / 任意ガンマのパラメータ
+    AddLabeledRow(LOCTEXT("WallEOTF", "壁の表示特性 (EOTF)"),
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(1.0f)
+        [
+            SNew(SEnumComboBox, StaticEnum<ELightSyncInputTransfer>())
+                .CurrentValue_Lambda([W]() -> int32 { return W.IsValid() ? static_cast<int32>(W->WallDisplayEOTF) : 0; })
+                .OnEnumSelectionChanged_Lambda([W](int32 V, ESelectInfo::Type) { MarkProbeDirty(W); if (W.IsValid()) W->WallDisplayEOTF = static_cast<ELightSyncInputTransfer>(V); })
+        ]
+        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8, 0, 4, 0)
+        [
+            SNew(STextBlock)
+                .Text_Lambda([W]() -> FText {
+                    if (!W.IsValid()) return FText::GetEmpty();
+                    if (W->WallDisplayEOTF == ELightSyncInputTransfer::PQ) return LOCTEXT("PQNits", "1.0 = (nits)");
+                    if (W->WallDisplayEOTF == ELightSyncInputTransfer::Gamma) return LOCTEXT("WallGammaLabel", "ガンマ");
+                    return FText::GetEmpty();
+                })
+        ]
+        + SHorizontalBox::Slot().FillWidth(0.6f)
+        [
+            SNew(SSpinBox<float>)
+                .MinValue(1.0f).MaxValue(10000.0f).Delta(0.01f)
+                .Visibility_Lambda([W]() {
+                    return (W.IsValid() && (W->WallDisplayEOTF == ELightSyncInputTransfer::PQ || W->WallDisplayEOTF == ELightSyncInputTransfer::Gamma))
+                        ? EVisibility::Visible : EVisibility::Hidden;
+                })
+                .Value_Lambda([W]() {
+                    if (!W.IsValid()) return 1.0f;
+                    return W->WallDisplayEOTF == ELightSyncInputTransfer::PQ ? W->PQReferenceWhiteNits : W->WallGamma;
+                })
+                .OnValueChanged_Lambda([W](float V) {
+                    MarkProbeDirty(W);
+                    if (!W.IsValid()) return;
+                    if (W->WallDisplayEOTF == ELightSyncInputTransfer::PQ) W->PQReferenceWhiteNits = V;
+                    else W->WallGamma = FMath::Clamp(V, 1.0f, 4.0f);
+                })
+        ]);
+
+    // OCIO
+    AddLabeledRow(LOCTEXT("OCIOSource", "OCIO"),
+        SNew(SEnumComboBox, StaticEnum<ELightSyncOCIOSource>())
+            .CurrentValue_Lambda([W]() -> int32 { return W.IsValid() ? static_cast<int32>(W->OCIOSource) : 0; })
+            .OnEnumSelectionChanged_Lambda([W](int32 V, ESelectInfo::Type) { MarkProbeDirty(W); if (W.IsValid()) W->OCIOSource = static_cast<ELightSyncOCIOSource>(V); }));
+
+    AddLabeledRow(LOCTEXT("OCIOGamut", "OCIO の出力の色域"),
+        SNew(SEnumComboBox, StaticEnum<ELightSyncDisplayGamut>())
+            .CurrentValue_Lambda([W]() -> int32 { return W.IsValid() ? static_cast<int32>(W->OCIODisplayGamut) : 0; })
+            .OnEnumSelectionChanged_Lambda([W](int32 V, ESelectInfo::Type) { MarkProbeDirty(W); if (W.IsValid()) W->OCIODisplayGamut = static_cast<ELightSyncDisplayGamut>(V); }));
+
+    AddLabeledRow(LOCTEXT("OCIOState", "OCIO の状態"),
+        SNew(STextBlock)
+            .AutoWrapText(true)
+            .Text_Lambda([W]() -> FText {
+                if (!W.IsValid()) return FText::GetEmpty();
+                if (W->ReferenceMode != ELightSyncReferenceMode::Wall) return LOCTEXT("OCIOSceneMode", "- (Scene Light モードでは使いません)");
+                FString Text = W->OCIOReport.IsEmpty() ? FString(TEXT("(まだキャプチャしていません)")) : W->OCIOReport;
+                if (W->OCIOSource == ELightSyncOCIOSource::Manual) Text += TEXT("\nManual の変換は Details パネルの OCIO Settings で設定");
+                return FText::FromString(Text);
+            }));
+
     AddLabeledRow(LOCTEXT("ManualEV", "手動露出 EV100"),
         SNew(SSpinBox<float>)
             .MinValue(-10.0f).MaxValue(20.0f).Delta(0.1f)

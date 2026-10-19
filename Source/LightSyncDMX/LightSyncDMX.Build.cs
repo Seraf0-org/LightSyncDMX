@@ -22,6 +22,7 @@ public class LightSyncDMX : ModuleRules
             "DMXProtocol",
             "DMXRuntime",
             "OSC",
+            "OpenColorIO",    // nDisplay / ビューポートと同じ OCIO 変換をキャプチャに掛ける
         });
 
         PrivateDependencyModuleNames.AddRange(new string[]

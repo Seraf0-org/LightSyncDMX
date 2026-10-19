@@ -276,4 +276,51 @@ bool FLightSyncZonesChangeTest::RunTest(const FString &Parameters)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLightSyncZonesHDRTransferTest, "LightSync.Zones.DecodesPQAndCustomGamma",
+                                 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::EngineFilter)
+bool FLightSyncZonesHDRTransferTest::RunTest(const FString &Parameters)
+{
+    // SMPTE ST 2084 の既知の値 (コード値 → nits)
+    struct FPoint { float Code; float Nits; };
+    const FPoint Points[] = {{0.0f, 0.0f}, {0.5080784f, 100.0f}, {0.5806888f, 203.0f}, {0.7518271f, 1000.0f}, {1.0f, 10000.0f}};
+    for (const FPoint &P : Points)
+    {
+        const float Nits = LightSyncZones::PQToNits(P.Code);
+        TestTrue(FString::Printf(TEXT("PQ %.4f -> %.3f nits (%.1f)"), P.Code, Nits, P.Nits),
+                 FMath::Abs(Nits - P.Nits) <= FMath::Max(0.002f * P.Nits, 1e-4f));
+    }
+
+    // 正規化: 1.0 = 基準白
+    TestTrue(TEXT("PQ 100 nits = 1.0 (ref 100)"),
+             FMath::IsNearlyEqual(LightSyncZones::DecodeTransfer(ELightSyncInputTransfer::PQ, 0.5080784f, 2.2f, 100.0f), 1.0f, 2e-3f));
+    TestTrue(TEXT("PQ 1000 nits = 5.0 (ref 200)"),
+             FMath::IsNearlyEqual(LightSyncZones::DecodeTransfer(ELightSyncInputTransfer::PQ, 0.7518271f, 2.2f, 200.0f), 5.0f, 1e-2f));
+
+    // 任意ガンマ
+    TestTrue(TEXT("gamma 2.35"),
+             FMath::IsNearlyEqual(LightSyncZones::DecodeTransfer(ELightSyncInputTransfer::Gamma, 0.5f, 2.35f), FMath::Pow(0.5f, 2.35f), 1e-6f));
+
+    // 積分も texel ごとにデコードする: PQ で 100 nits の一様な環境 → 全ゾーン 1.0
+    TArray<FLinearColor> Faces[6];
+    MakeCube(Faces, [](const FVector3f &) { return FLinearColor(0.5080784f, 0.5080784f, 0.5080784f); });
+    TArray<FLightSyncZone> Zones;
+    Zones.Add(MakeZone("Sphere", ELightSyncZoneShape::Sphere, FVector::UpVector, false));
+    Zones.Add(MakeZone("Irr", ELightSyncZoneShape::Irradiance, FVector::UpVector, false));
+    LightSyncZones::FSetup Setup = LightSyncZones::BuildSetup(Zones, FQuat::Identity, 4.0f, FVector3f(0.2126f, 0.7152f, 0.0722f),
+                                                              ELightSyncInputTransfer::PQ);
+    Setup.PQReferenceWhiteNits = 100.0f;
+    const LightSyncZones::FResult R = LightSyncZones::IntegrateCube(Faces, TestCubeSize, Setup);
+    TestTrue(FString::Printf(TEXT("PQ uniform sphere %.4f"), R.Zones[0].X), NearlyEqualRel(R.Zones[0].X, 1.0f, 3e-3f));
+    TestTrue(FString::Printf(TEXT("PQ uniform irradiance %.4f"), R.Zones[1].X), NearlyEqualRel(R.Zones[1].X, 1.0f, 3e-3f));
+
+    // 表示の色域: Rec.2020 の白は白、Rec.2020 の純赤は Rec.709 の外 (負の成分を持つ)
+    const UE::Color::FColorSpaceTransform ToSRGB(LightSyncZones::GetDisplayColorSpace(ELightSyncDisplayGamut::Rec2020),
+                                                 UE::Color::FColorSpace(UE::Color::EColorSpace::sRGB));
+    const FLinearColor White = ToSRGB.Apply(FLinearColor(1.0f, 1.0f, 1.0f));
+    TestTrue(TEXT("Rec.2020 white stays white"), White.Equals(FLinearColor(1.0f, 1.0f, 1.0f), 1e-3f));
+    const FLinearColor Red = ToSRGB.Apply(FLinearColor(1.0f, 0.0f, 0.0f));
+    TestTrue(FString::Printf(TEXT("Rec.2020 red in Rec.709: %.3f %.3f %.3f"), Red.R, Red.G, Red.B), Red.R > 1.5f && Red.G < 0.0f);
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

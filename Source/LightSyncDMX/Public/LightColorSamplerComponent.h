@@ -6,9 +6,11 @@
 #include "Components/ActorComponent.h"
 #include "LightSyncGPUSampler.h"
 #include "LightSyncZones.h"
+#include "LightSyncOCIO.h"
 #include "LightColorSamplerComponent.generated.h"
 
 class UTextureRenderTargetCube;
+class UTextureRenderTarget2D;
 
 /** サンプリング方式 */
 UENUM(BlueprintType)
@@ -30,14 +32,26 @@ struct FLightSyncSampleContext
     /** キャプチャ値 → 正規化値 の倍率 (露出) */
     float ExposureScale = 1.0f;
 
-    /** キャプチャが sRGB/Rec.709 原色か (false なら作業色空間) */
-    bool bInputIsSRGBGamut = false;
+    /** キャプチャ (デコード後) が表示の色域 InputGamut の値か (false なら作業色空間) */
+    bool bInputIsDisplayGamut = false;
+
+    /** bInputIsDisplayGamut のときの色域 (OCIO なしの Wall モードは Rec.709) */
+    ELightSyncDisplayGamut InputGamut = ELightSyncDisplayGamut::Rec709;
 
     /** キャプチャ値の伝達関数 (Wall モードは表示用にエンコード済みの値なので EOTF でデコードする) */
     ELightSyncInputTransfer InputTransfer = ELightSyncInputTransfer::Linear;
 
     /** デコード後に掛ける補正ガンマ (壁の実際の応答カーブをキャリブレーションで合わせる。1 = 補正なし) */
     float TransferGamma = 1.0f;
+
+    /** InputTransfer = Gamma のときのガンマ */
+    float DecodeGamma = 2.2f;
+
+    /** InputTransfer = PQ のとき 1.0 とする明るさ (nits) */
+    float PQReferenceWhiteNits = 100.0f;
+
+    /** 積分の前に掛ける OCIO (無効なら掛けない) */
+    FLightSyncOCIOPass OCIO;
 };
 
 /**
@@ -152,6 +166,7 @@ private:
     LightSyncZones::FResult LastRawResult;
     LightSyncZones::FSetup LastSetup;
     TWeakObjectPtr<UTextureRenderTargetCube> LastRenderTarget;
+    TWeakObjectPtr<UTextureRenderTarget2D> LastOCIOAtlas;
 
     /** ディスパッチ時の文脈 (結果の反映に使う) と時刻 */
     FLightSyncSampleContext PendingContext;

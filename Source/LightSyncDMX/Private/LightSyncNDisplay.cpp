@@ -1,6 +1,8 @@
 // Copyright UE-Comp. All Rights Reserved.
 
 #include "LightSyncNDisplay.h"
+#include "LightSyncOCIO.h"
+#include "OpenColorIOColorSpace.h"
 #include "LightSyncDMXModule.h"
 
 #include "EngineUtils.h"
@@ -571,6 +573,110 @@ namespace LightSyncNDisplay
         }
 
         OutPP = Composite;
+        return true;
+    }
+
+    // ============================================================
+    // OCIO
+    // ============================================================
+
+    int32 SelectViewportOCIO(bool bAllViewportsEnabled, TConstArrayView<FOCIOProfileDesc> Profiles, const FString& ViewportId)
+    {
+        if (!bAllViewportsEnabled)
+        {
+            return -2;
+        }
+        for (int32 Index = 0; Index < Profiles.Num(); ++Index)
+        {
+            if (!Profiles[Index].bIsEnabled)
+            {
+                continue;
+            }
+            for (const FString& Object : Profiles[Index].ApplyToObjects)
+            {
+                if (ViewportId.Compare(Object, ESearchCase::IgnoreCase) == 0)
+                {
+                    return Index;
+                }
+            }
+        }
+        return -1;
+    }
+
+    bool FindOuterViewportOCIO(const AActor* RootActor, const FString& ViewportId,
+                               FOpenColorIOColorConversionSettings& OutSettings, FString& OutReport)
+    {
+        OutReport.Reset();
+        UObject* ConfigData = GetConfigData(RootActor);
+        if (!ConfigData)
+        {
+            OutReport = TEXT("nDisplay の RootActor (設定データ) が見つかりません");
+            return false;
+        }
+
+        const UScriptStruct* StageType = nullptr;
+        const void* Stage = GetStructMember(ConfigData->GetClass(), ConfigData, TEXT("StageSettings"), StageType);
+        const UScriptStruct* OCIOType = nullptr;
+        const void* ViewportOCIO = GetStructMember(StageType, Stage, TEXT("ViewportOCIO"), OCIOType);
+        const UScriptStruct* AllType = nullptr;
+        const void* All = GetStructMember(OCIOType, ViewportOCIO, TEXT("AllViewportsOCIOConfiguration"), AllType);
+        if (!All)
+        {
+            OutReport = TEXT("この nDisplay には OCIO の設定がありません");
+            return false;
+        }
+
+        // プロファイルを並べて、nDisplay と同じ規則で選ぶ
+        TArray<FOCIOProfileDesc> Profiles;
+        TArray<const void*> ProfileData;
+        const UScriptStruct* ProfileType = nullptr;
+        if (const FArrayProperty* ProfileArray = CastField<FArrayProperty>(FindProp(OCIOType, TEXT("PerViewportOCIOProfiles"))))
+        {
+            const FStructProperty* Inner = CastField<FStructProperty>(ProfileArray->Inner);
+            ProfileType = Inner ? Inner->Struct : nullptr;
+            FScriptArrayHelper Array(ProfileArray, ProfileArray->ContainerPtrToValuePtr<void>(ViewportOCIO));
+            for (int32 Index = 0; ProfileType && Index < Array.Num(); ++Index)
+            {
+                const void* Item = Array.GetRawPtr(Index);
+                FOCIOProfileDesc& Desc = Profiles.AddDefaulted_GetRef();
+                Desc.bIsEnabled = GetBool(ProfileType, Item, TEXT("bIsEnabled"));
+                if (const FArrayProperty* Targets = CastField<FArrayProperty>(FindProp(ProfileType, TEXT("ApplyOCIOToObjects"))))
+                {
+                    FScriptArrayHelper TargetArray(Targets, Targets->ContainerPtrToValuePtr<void>(Item));
+                    for (int32 T = 0; T < TargetArray.Num(); ++T)
+                    {
+                        Desc.ApplyToObjects.Add(*static_cast<const FString*>(static_cast<const void*>(TargetArray.GetRawPtr(T))));
+                    }
+                }
+                ProfileData.Add(Item);
+            }
+        }
+
+        const int32 Selected = SelectViewportOCIO(GetBool(AllType, All, TEXT("bIsEnabled")), Profiles, ViewportId);
+        if (Selected == -2)
+        {
+            OutReport = TEXT("nDisplay の OCIO (All Viewports) は無効");
+            return false;
+        }
+
+        const UScriptStruct* ColorType = nullptr;
+        const void* Color = Selected >= 0
+            ? GetStructMember(ProfileType, ProfileData[Selected], TEXT("ColorConfiguration"), ColorType)
+            : GetStructMember(AllType, All, TEXT("ColorConfiguration"), ColorType);
+        if (!Color || ColorType != FOpenColorIOColorConversionSettings::StaticStruct())
+        {
+            OutReport = TEXT("nDisplay の OCIO の設定を読めませんでした");
+            return false;
+        }
+
+        OutSettings = *static_cast<const FOpenColorIOColorConversionSettings*>(Color);
+        const FString Which = Selected >= 0 ? FString::Printf(TEXT("ビューポート '%s' のプロファイル"), *ViewportId) : FString(TEXT("全ビューポート"));
+        if (!LightSyncOCIO::IsConfigured(OutSettings))
+        {
+            OutReport = FString::Printf(TEXT("nDisplay の OCIO (%s) は変換が未設定のため掛けない"), *Which);
+            return false;
+        }
+        OutReport = FString::Printf(TEXT("nDisplay の OCIO (%s): %s"), *Which, *LightSyncOCIO::Describe(OutSettings));
         return true;
     }
 }

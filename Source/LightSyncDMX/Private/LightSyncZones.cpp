@@ -7,10 +7,39 @@ namespace LightSyncZones
     // シェーダー (LightSyncAverageCS.usf) のスレッド配置と一致させる
     static constexpr int32 ThreadsPerSide = 16;
 
-    float DecodeTransfer(ELightSyncInputTransfer Transfer, float Value)
+    UE::Color::FColorSpace GetDisplayColorSpace(ELightSyncDisplayGamut Gamut)
+    {
+        switch (Gamut)
+        {
+        case ELightSyncDisplayGamut::P3D65:
+            return UE::Color::FColorSpace(UE::Color::EColorSpace::P3D65);
+        case ELightSyncDisplayGamut::Rec2020:
+            return UE::Color::FColorSpace(UE::Color::EColorSpace::Rec2020);
+        default:
+            return UE::Color::FColorSpace(UE::Color::EColorSpace::sRGB);
+        }
+    }
+
+    float PQToNits(float Code)
+    {
+        // SMPTE ST 2084
+        constexpr float M1 = 2610.0f / 16384.0f;
+        constexpr float M2 = 2523.0f / 4096.0f * 128.0f;
+        constexpr float C1 = 3424.0f / 4096.0f;
+        constexpr float C2 = 2413.0f / 4096.0f * 32.0f;
+        constexpr float C3 = 2392.0f / 4096.0f * 32.0f;
+        const float P = FMath::Pow(FMath::Clamp(Code, 0.0f, 1.0f), 1.0f / M2);
+        return 10000.0f * FMath::Pow(FMath::Max(P - C1, 0.0f) / (C2 - C3 * P), 1.0f / M1);
+    }
+
+    float DecodeTransfer(ELightSyncInputTransfer Transfer, float Value, float Gamma, float PQReferenceWhiteNits)
     {
         switch (Transfer)
         {
+        case ELightSyncInputTransfer::PQ:
+            return PQToNits(Value) / FMath::Max(PQReferenceWhiteNits, 0.01f);
+        case ELightSyncInputTransfer::Gamma:
+            return FMath::Pow(FMath::Max(Value, 0.0f), Gamma);
         case ELightSyncInputTransfer::SRGB:
             Value = FMath::Max(Value, 0.0f);
             return Value <= 0.04045f ? Value / 12.92f : FMath::Pow((Value + 0.055f) / 1.055f, 2.4f);
@@ -128,7 +157,7 @@ namespace LightSyncZones
         // シェーダーの DecodeTransfer → clamp(L, 0, 65504) と同じ。NaN は 0 に落とす
         auto Clean = [&Setup](float V)
         {
-            V = DecodeTransfer(Setup.InputTransfer, V);
+            V = DecodeTransfer(Setup.InputTransfer, V, Setup.DecodeGamma, Setup.PQReferenceWhiteNits);
             if (Setup.TransferGamma != 1.0f)
             {
                 V = FMath::Pow(FMath::Max(V, 0.0f), Setup.TransferGamma);

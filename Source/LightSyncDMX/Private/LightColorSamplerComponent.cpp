@@ -97,8 +97,8 @@ void ULightColorSamplerComponent::Dispatch(UTextureRenderTargetCube *InCubeRT, c
     }
 
     // ピーク探索に使う輝度係数は、キャプチャ値の色空間に合わせる
-    const FLinearColor LumFactors = Context.bInputIsSRGBGamut
-        ? FLinearColor(0.2126f, 0.7152f, 0.0722f)
+    const FLinearColor LumFactors = Context.bInputIsDisplayGamut
+        ? LightSyncZones::GetDisplayColorSpace(Context.InputGamut).GetLuminanceFactors()
         : UE::Color::FColorSpace::GetWorking().GetLuminanceFactors();
 
     const TArray<FLightSyncZone> Active = GetActiveZones();
@@ -106,15 +106,19 @@ void ULightColorSamplerComponent::Dispatch(UTextureRenderTargetCube *InCubeRT, c
                                                               FVector3f(LumFactors.R, LumFactors.G, LumFactors.B),
                                                               Context.InputTransfer);
     Setup.TransferGamma = Context.TransferGamma;
+    Setup.DecodeGamma = Context.DecodeGamma;
+    Setup.PQReferenceWhiteNits = Context.PQReferenceWhiteNits;
 
     GPUSampler->SetSetup(Setup);
     GPUSampler->SetForceCPUSync(SamplingMethod == ELightSyncSamplingMethod::CPUSync);
-    GPUSampler->DispatchSampling(InCubeRT);
+    const bool bUseOCIO = Context.OCIO.IsValid();
+    GPUSampler->DispatchSampling(InCubeRT, bUseOCIO ? &Context.OCIO : nullptr);
 
     PendingContext = Context;
     DispatchTime = FPlatformTime::Seconds();
     LastSetup = Setup;
     LastRenderTarget = InCubeRT;
+    LastOCIOAtlas = bUseOCIO ? Context.OCIO.Atlas : nullptr;
 }
 
 bool ULightColorSamplerComponent::PollNewResult()
@@ -185,10 +189,11 @@ void ULightColorSamplerComponent::ApplyNewResult(const LightSyncZones::FResult &
         const FVector4f &Raw = Result.Zones[Index];
         FLinearColor Color(Raw.X, Raw.Y, Raw.Z, 1.0f);
 
-        // sRGB 原色のキャプチャ (FinalToneCurveHDR) は作業色空間へ変換。線形変換なので積分後に掛けてよい
-        if (Context.bInputIsSRGBGamut)
+        // 表示の色域 (OCIO なしの Wall モードは sRGB 原色) は作業色空間へ変換。線形変換なので積分後に掛けてよい
+        if (Context.bInputIsDisplayGamut)
         {
-            Color = UE::Color::FColorSpaceTransform::GetSRGBToWorkingColorSpace().Apply(Color);
+            Color = UE::Color::FColorSpaceTransform(LightSyncZones::GetDisplayColorSpace(Context.InputGamut),
+                                                    UE::Color::FColorSpace::GetWorking()).Apply(Color);
         }
         Color *= Context.ExposureScale;
         Color.A = 1.0f;
@@ -216,11 +221,14 @@ bool ULightColorSamplerComponent::ValidateAgainstCPU(FString &OutReport, float &
         return false;
     }
 
+    // OCIO を掛けた場合は、GPU が積分したのと同じ OCIO 後のアトラスを読む
     TArray<FLinearColor> Faces[6];
     int32 Size = 0;
-    if (!FLightSyncGPUSampler::ReadCubeTexels(RT, Faces, Size))
+    const bool bRead = LastOCIOAtlas.IsValid() ? FLightSyncGPUSampler::ReadAtlasTexels(LastOCIOAtlas.Get(), Faces, Size)
+                                               : FLightSyncGPUSampler::ReadCubeTexels(RT, Faces, Size);
+    if (!bRead)
     {
-        OutReport = TEXT("キューブマップを CPU で読み出せませんでした");
+        OutReport = TEXT("キャプチャを CPU で読み出せませんでした");
         return false;
     }
 

@@ -7,6 +7,7 @@
 
 class AActor;
 class UWorld;
+struct FOpenColorIOColorConversionSettings;
 
 /**
  * LightSyncNDisplay
@@ -47,4 +48,25 @@ namespace LightSyncNDisplay
      */
     LIGHTSYNCDMX_API bool BuildOuterViewportPostProcess(const AActor* RootActor, const FString& ViewportId, const FPostProcessSettings& ScenePP,
                                                         FPostProcessSettings& OutPP, FString& OutReport);
+
+    /** OCIO のプロファイル 1 件 (選択規則のテスト用に nDisplay の型から切り離したもの) */
+    struct FOCIOProfileDesc
+    {
+        bool bIsEnabled = false;
+        TArray<FString> ApplyToObjects;
+    };
+
+    /**
+     * 外側ビューポートの OCIO の選び方 (FDisplayClusterConfigurationICVFX_ViewportOCIO::FindOCIOConfiguration と同じ):
+     * 「全ビューポート」が無効なら OCIO なし。有効なら、このビューポートを対象にした有効なプロファイル (先勝ち)、なければ全ビューポートの設定。
+     * @return -2 = OCIO なし, -1 = 全ビューポートの設定, 0 以上 = プロファイルの番号
+     */
+    LIGHTSYNCDMX_API int32 SelectViewportOCIO(bool bAllViewportsEnabled, TConstArrayView<FOCIOProfileDesc> Profiles, const FString& ViewportId);
+
+    /**
+     * nDisplay が外側ビューポートに掛ける OCIO (StageSettings.ViewportOCIO) を読む。
+     * @return 掛ける OCIO があれば true (変換が未設定のものは nDisplay も掛けないので false)
+     */
+    LIGHTSYNCDMX_API bool FindOuterViewportOCIO(const AActor* RootActor, const FString& ViewportId,
+                                                FOpenColorIOColorConversionSettings& OutSettings, FString& OutReport);
 }

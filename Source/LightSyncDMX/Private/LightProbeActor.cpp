@@ -10,6 +10,9 @@
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/TextureRenderTargetCube.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "LightSyncOCIO.h"
+#include "OpenColorIORendering.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Camera/CameraComponent.h"
 #include "HAL/IConsoleManager.h"
@@ -384,6 +387,11 @@ bool ALightProbeActor::TryCaptureAndDispatch(bool bRespectBudget)
     const uint64 StartCycles = FPlatformTime::Cycles64();
 
     const FLightSyncSampleContext Context = ApplyCaptureSettings();
+    if (bOCIOPending)
+    {
+        // OCIO なしの値を出さないよう、シェーダーの準備ができるまで待つ
+        return false;
+    }
     SceneCapture->CaptureScene();
     ColorSampler->Dispatch(CaptureRenderTarget, Context);
     ++CapturesPerformed;
@@ -451,7 +459,10 @@ namespace
 {
     /**
      * UE の手動露出と同じ式で「シーン値 → カメラで 1.0 になる値」の倍率を求める。
-     * PostProcessEyeAdaptation.cpp: ExposureScale = 0.18 / (LuminanceMax * 2^EV100) * 2^Bias
+     * PostProcessEyeAdaptation.cpp (GetEyeAdaptationFixedExposure):
+     *   ExposureScale = 0.18 / (WhitePoint * 0.18) * Compensation = 2^Bias / (LuminanceMax * 2^EV100)
+     *   Manual の露出補正は 1.0 基準 (GreyMult = 1)。0.18 を掛けるのは自動露出のときだけ
+     * Wall モード (エンジンが露出を掛ける) と同じ尺度になることを実レンダリングで確認済み。
      */
     float ComputeManualExposureScale(float EV100, float Bias)
     {
@@ -463,7 +474,7 @@ namespace
             LuminanceMax = 0.78f / FMath::Max(LensAttenuation->GetFloat(), 0.01f);
         }
         const float WhitePointLuminance = LuminanceMax * FMath::Pow(2.0f, EV100);
-        return 0.18f / FMath::Max(WhitePointLuminance, 1e-6f) * FMath::Pow(2.0f, Bias);
+        return FMath::Pow(2.0f, Bias) / FMath::Max(WhitePointLuminance, 1e-6f);
     }
 
     /** 物理カメラ設定からの EV100 (CalculateManualAutoExposure と同じ式) */
@@ -531,6 +542,7 @@ FPostProcessSettings ALightProbeActor::BuildReferencePostProcess()
     {
         Result = ScenePP;
     }
+    bCachedNDisplayHasOCIO = LightSyncNDisplay::FindOuterViewportOCIO(Root, NDisplayViewportId, CachedNDisplayOCIO, CachedNDisplayOCIOReport);
     CachedNDisplayPP = Result;
     CachedNDisplayTime = Now;
     CachedNDisplayKey = Key;
@@ -574,13 +586,41 @@ FLightSyncSampleContext ALightProbeActor::ApplyCaptureSettings()
         // 露出・グレーディング・トーンカーブ適用後の値 (sRGB 原色)。
         // 実測で、この値は nDisplay が壁へ送る信号 (LDR のコード値 / 255) と一致する = 表示用にエンコード済み。
         // 壁が出す光は EOTF(信号) なので、texel ごとに WallDisplayEOTF でデコードしてから積分する
-        SceneCapture->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
         Flags.SetPostProcessing(true);
         Flags.SetTonemapper(true);
         Flags.SetColorGrading(true);
         Flags.SetEyeAdaptation(true);
 
         FPostProcessSettings PP = ReferencePP;
+
+        // OCIO: nDisplay の外側ビューポートと同じく、トーンカーブなしのリニア値に OCIO を掛ける
+        // (FOpenColorIORendering::PrepareView と同じ: ToneCurve オフ、出力は FinalColorHDR、ToneCurveAmount = 0)
+        bOCIOPending = false;
+        FLightSyncOCIOPass OCIOPass;
+        if (const FOpenColorIOColorConversionSettings *OCIO = ResolveOCIO())
+        {
+            const UWorld *World = GetWorld();
+            OCIOPass.Resources = FOpenColorIORendering::GetRenderPassResources(*OCIO, World ? World->GetFeatureLevel() : GMaxRHIFeatureLevel);
+            OCIOPass.Atlas = OCIOPass.Resources.IsValid() ? EnsureOCIOAtlas() : nullptr;
+            if (OCIOPass.IsValid())
+            {
+                OCIOReport = TEXT("適用中: ") + LightSyncOCIO::Describe(*OCIO);
+            }
+            else
+            {
+                OCIOReport = TEXT("OCIO のシェーダーを準備中 (準備ができるまでキャプチャを見送ります): ") + LightSyncOCIO::Describe(*OCIO);
+                bOCIOPending = true;
+            }
+        }
+
+        const bool bUseOCIO = OCIOPass.IsValid();
+        SceneCapture->CaptureSource = bUseOCIO ? ESceneCaptureSource::SCS_FinalColorHDR : ESceneCaptureSource::SCS_FinalToneCurveHDR;
+        Flags.SetToneCurve(!bUseOCIO);
+        if (bUseOCIO)
+        {
+            PP.bOverride_ToneCurveAmount = true;
+            PP.ToneCurveAmount = 0.0f;
+        }
 
         // 露出は必ず手動に固定 (キューブキャプチャが自分の中身に自動露出しないように)。
         // 物理カメラ分は Bias に畳み込む: 0.18 * 2^(Bias - EV100) と同じ倍率になる
@@ -595,8 +635,12 @@ FLightSyncSampleContext ALightProbeActor::ApplyCaptureSettings()
         SceneCapture->PostProcessBlendWeight = 1.0f;
 
         Context.ExposureScale = OutputGain; // 露出はエンジンが適用済み
-        Context.bInputIsSRGBGamut = true;
+        Context.bInputIsDisplayGamut = true;
+        Context.InputGamut = bUseOCIO ? OCIODisplayGamut : ELightSyncDisplayGamut::Rec709;
         Context.InputTransfer = WallDisplayEOTF;
+        Context.DecodeGamma = WallGamma;
+        Context.PQReferenceWhiteNits = PQReferenceWhiteNits;
+        Context.OCIO = OCIOPass;
         Context.TransferGamma = (DMXOutput && DMXOutput->StageCalibration) ? DMXOutput->StageCalibration->ReferenceGamma : 1.0f;
     }
     else
@@ -608,12 +652,62 @@ FLightSyncSampleContext ALightProbeActor::ApplyCaptureSettings()
         SceneCapture->PostProcessBlendWeight = 0.0f;
 
         Context.ExposureScale = EffectiveExposureScale * OutputGain;
-        Context.bInputIsSRGBGamut = false;
+        Context.bInputIsDisplayGamut = false;
+        bOCIOPending = false;
+        OCIOReport = TEXT("Scene Light モードでは使いません");
     }
 
     return Context;
 }
 
+
+const FOpenColorIOColorConversionSettings *ALightProbeActor::ResolveOCIO()
+{
+    switch (OCIOSource)
+    {
+    case ELightSyncOCIOSource::Manual:
+        if (LightSyncOCIO::IsConfigured(OCIOSettings))
+        {
+            return &OCIOSettings;
+        }
+        OCIOReport = TEXT("OCIO Settings が未設定 (OCIO なし)");
+        return nullptr;
+
+    case ELightSyncOCIOSource::Auto:
+        if (PostProcessSource == ELightSyncPostProcessSource::NDisplay)
+        {
+            // BuildReferencePostProcess (直前に呼ばれる) が 0.25 秒ごとに読み直している
+            if (bCachedNDisplayHasOCIO)
+            {
+                return &CachedNDisplayOCIO;
+            }
+            OCIOReport = CachedNDisplayOCIOReport;
+            return nullptr;
+        }
+        OCIOReport = TEXT("なし (Auto: Post Process Source が nDisplay のときだけ nDisplay の OCIO を使う)");
+        return nullptr;
+
+    default:
+        OCIOReport = TEXT("Off");
+        return nullptr;
+    }
+}
+
+UTextureRenderTarget2D *ALightProbeActor::EnsureOCIOAtlas()
+{
+    const int32 Size = CaptureRenderTarget ? CaptureRenderTarget->SizeX : CaptureResolution;
+    if (OCIOAtlas && OCIOAtlas->SizeX == Size * 6 && OCIOAtlas->SizeY == Size)
+    {
+        return OCIOAtlas;
+    }
+    OCIOAtlas = NewObject<UTextureRenderTarget2D>(this, TEXT("OCIOAtlas"));
+    OCIOAtlas->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA16f;
+    OCIOAtlas->ClearColor = FLinearColor::Black;
+    OCIOAtlas->bAutoGenerateMips = false;
+    OCIOAtlas->InitAutoFormat(Size * 6, Size);
+    OCIOAtlas->UpdateResourceImmediate(true);
+    return OCIOAtlas;
+}
 
 void ALightProbeActor::InitializeCapture()
 {

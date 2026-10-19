@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "ColorManagement/ColorSpace.h"
 #include "LightSyncZones.generated.h"
 
 /**
@@ -39,6 +40,19 @@ enum class ELightSyncInputTransfer : uint8
     SRGB = 1 UMETA(DisplayName = "sRGB"),
     Gamma22 = 2 UMETA(DisplayName = "Gamma 2.2"),
     Gamma24 = 3 UMETA(DisplayName = "Gamma 2.4 (BT.1886)"),
+    /** HDR (SMPTE ST 2084)。1.0 = PQ Reference White (既定 100 nits) */
+    PQ = 4 UMETA(DisplayName = "PQ (ST 2084, HDR)"),
+    /** 任意のガンマ (Wall Gamma。例: 2.35) */
+    Gamma = 5 UMETA(DisplayName = "Gamma (Custom)"),
+};
+
+/** 表示 (壁へ送る信号) の色域。OCIO の出力をデコードした後、作業色空間へ変換するのに使う */
+UENUM(BlueprintType)
+enum class ELightSyncDisplayGamut : uint8
+{
+    Rec709 = 0 UMETA(DisplayName = "Rec.709 / sRGB"),
+    P3D65 = 1 UMETA(DisplayName = "P3-D65 (Display P3)"),
+    Rec2020 = 2 UMETA(DisplayName = "Rec.2020"),
 };
 
 /** ゾーン定義 (プローブ単位) */
@@ -130,6 +144,10 @@ namespace LightSyncZones
         ELightSyncInputTransfer InputTransfer = ELightSyncInputTransfer::Linear;
         /** デコード後に掛ける補正ガンマ (1 = なし) */
         float TransferGamma = 1.0f;
+        /** InputTransfer = Gamma のときのガンマ */
+        float DecodeGamma = 2.2f;
+        /** InputTransfer = PQ のとき 1.0 とする明るさ (nits) */
+        float PQReferenceWhiteNits = 100.0f;
     };
 
     /** 積分結果 (Zones と同じ並び) */
@@ -146,7 +164,13 @@ namespace LightSyncZones
                                        ELightSyncInputTransfer InputTransfer = ELightSyncInputTransfer::Linear);
 
     /** 伝達関数のデコード (シェーダーの DecodeTransfer と同じ) */
-    LIGHTSYNCDMX_API float DecodeTransfer(ELightSyncInputTransfer Transfer, float Value);
+    LIGHTSYNCDMX_API float DecodeTransfer(ELightSyncInputTransfer Transfer, float Value, float Gamma = 2.2f, float PQReferenceWhiteNits = 100.0f);
+
+    /** 表示の色域 → UE の色空間 */
+    LIGHTSYNCDMX_API UE::Color::FColorSpace GetDisplayColorSpace(ELightSyncDisplayGamut Gamut);
+
+    /** PQ (ST 2084) の EOTF。コード値 0-1 → 明るさ (nits) */
+    LIGHTSYNCDMX_API float PQToNits(float Code);
 
     /** キューブ面 texel (UV 0-1) → ワールド方向 (D3D キューブマップ規約) */
     LIGHTSYNCDMX_API FVector3f FaceUVToDirection(int32 Face, float U, float V);

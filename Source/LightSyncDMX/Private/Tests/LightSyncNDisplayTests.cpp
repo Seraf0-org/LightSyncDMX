@@ -55,4 +55,25 @@ bool FLightSyncNDisplayNoRootTest::RunTest(const FString &Parameters)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLightSyncNDisplayOCIOSelectTest, "LightSync.NDisplay.ViewportOCIOSelection",
+                                 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::EngineFilter)
+bool FLightSyncNDisplayOCIOSelectTest::RunTest(const FString &Parameters)
+{
+    using LightSyncNDisplay::FOCIOProfileDesc;
+    TArray<FOCIOProfileDesc> Profiles;
+    Profiles.Add({false, {TEXT("VP_0")}});            // 無効なプロファイル
+    Profiles.Add({true, {TEXT("VP_1"), TEXT("vp_0")}}); // VP_0 と VP_1 (大文字小文字は無視)
+    Profiles.Add({true, {TEXT("VP_1")}});              // 先勝ちなので VP_1 は 1 番
+
+    // 全ビューポートが無効なら、プロファイルがあっても OCIO なし (nDisplay と同じ)
+    TestEqual(TEXT("all disabled -> none"), LightSyncNDisplay::SelectViewportOCIO(false, Profiles, TEXT("VP_1")), -2);
+    // 無効なプロファイルは飛ばす
+    TestEqual(TEXT("VP_0 -> profile 1"), LightSyncNDisplay::SelectViewportOCIO(true, Profiles, TEXT("VP_0")), 1);
+    TestEqual(TEXT("VP_1 -> first match"), LightSyncNDisplay::SelectViewportOCIO(true, Profiles, TEXT("VP_1")), 1);
+    // 対象外 / ビューポート未指定は全ビューポートの設定
+    TestEqual(TEXT("VP_9 -> all viewports"), LightSyncNDisplay::SelectViewportOCIO(true, Profiles, TEXT("VP_9")), -1);
+    TestEqual(TEXT("empty id -> all viewports"), LightSyncNDisplay::SelectViewportOCIO(true, Profiles, FString()), -1);
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

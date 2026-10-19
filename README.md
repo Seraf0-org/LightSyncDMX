@@ -1,4 +1,4 @@
-# LightSync DMX 2.0
+# LightSync DMX 2.1
 
 バーチャルプロダクション (VP) で、**実際の照明を、LEDウォール (または仮想シーン) の光と同じ色・同じ強さの比率で光らせる** Unreal Engine 5.7 プラグインです。
 
@@ -9,7 +9,7 @@
 - 色の基準を **LEDウォールの表示色** と **シーンの物理的な光** から選べる
 - 灯体の色は **カメラ上で一致するように** ソルバで解く (RGB / RGBW / RGBAW / CCT など、16bit 対応)
 - **カメラだけ** で灯体と壁をキャリブレーションできる
-- **nDisplay** の外側ビューポートと同じ露出・カラーグレーディングを使える
+- **nDisplay** の外側ビューポートと同じ露出・カラーグレーディング・**OCIO** を使える (PQ などの HDR の壁にも対応)
 - **照明を送る PC を選べる**。nDisplay のクラスタでは 1 台だけが送り、別の PC から送ることもできる
 - 終了時は **直接ブラックアウト** を送るので、アプリを閉じても照明が点いたまま残らない
 
@@ -24,7 +24,7 @@
 5. [灯体と DMX 出力](#灯体と-dmx-出力)
 6. [OSC 出力](#osc-出力)
 7. [キャリブレーション (カメラ)](#キャリブレーション-カメラ)
-8. [nDisplay 連携](#ndisplay-連携)
+8. [nDisplay 連携](#ndisplay-連携) / [OCIO](#ocio)
 9. [照明を送る PC](#照明を送る-pc)
 10. [性能と遅延](#性能と遅延)
 11. [モニターウィンドウ](#モニターウィンドウ)
@@ -69,7 +69,7 @@
 
 ## クイックスタート
 
-1. プラグインを有効にする (依存: DMX Protocol / DMX Engine / OSC。いずれも UE 同梱)
+1. プラグインを有効にする (依存: DMX Protocol / DMX Engine / OSC / OpenColorIO。いずれも UE 同梱で、自動で有効になる)
 2. **Project Settings → Plugins → DMX → Output Ports** に Art-Net / sACN の出力ポートを追加
 3. **Place Actors** で「Light Probe (DMX)」を検索し、被写体の位置に置く
 4. プローブの Details:
@@ -87,8 +87,8 @@
 
 | モード | 使う値 | 向いている場面 |
 |--------|--------|---------------|
-| **LED Wall** (既定) | 参照カメラと同じ露出・グレーディング・トーンカーブを通した値。壁へ送る信号そのもの (実測で LDR のコード値と一致) を、**画素ごとに** 壁の表示特性 (`Wall Display EOTF`: sRGB / ガンマ 2.2 / 2.4) で光に戻してから積分する | 壁と照明をカメラ上で揃えたい (通常はこちら) |
-| **Scene Light** | トーンマップ前の放射輝度に、UE の手動露出と同じ倍率 `0.18 × 2^(Bias − EV100)` を掛けた値 | 仮想シーンの光をそのまま再現したい。グレーディングの影響を受けたくない |
+| **LED Wall** (既定) | 参照カメラと同じ露出・グレーディング・トーンカーブを通した値。壁へ送る信号そのもの (実測で LDR のコード値と一致) を、**画素ごとに** 壁の表示特性 (`Wall Display EOTF`: sRGB / ガンマ 2.2 / 2.4 / 任意のガンマ / PQ) で光に戻してから積分する。[OCIO](#ocio) を使う壁にも対応 | 壁と照明をカメラ上で揃えたい (通常はこちら) |
+| **Scene Light** | トーンマップ前の放射輝度に、UE の手動露出と同じ倍率 `2^(Bias − EV100)` を掛けた値 (EV100 = 0、Bias = 0 ならシーン値そのもの) | 仮想シーンの光をそのまま再現したい。グレーディングの影響を受けたくない |
 
 どちらも「カメラで 1.0 になる明るさ」を基準白にしているので、モードを切り替えても強さの尺度は同じです。
 
@@ -295,6 +295,38 @@ nDisplay モジュールにはリンクせず、リフレクションで設定�
 
 ---
 
+## OCIO
+
+nDisplay (または壁へ送るビューポート) が **OCIO** を使う構成に対応しています。LED Wall モードだけで使います。
+
+**nDisplay が OCIO を掛けるときの壁の信号** (UE 5.7 の nDisplay と OpenColorIO プラグインのソースで確認)
+
+```
+シーン → 露出・カラーグレーディング (トーンカーブなし、リニア) → OCIO の変換 → 壁へ送るコード値
+```
+
+プローブも同じことをします。
+
+1. キューブを **トーンカーブなしのリニア値** (`FinalColorHDR`、Tone Curve オフ) でキャプチャ
+2. 6 面を 1 枚に並べ、nDisplay と **同じ OCIO のシェーダー** を掛ける
+3. texel ごとに `Wall Display EOTF` でデコード (PQ / ガンマ / sRGB) → `OCIO Display Gamut` から作業色空間へ → 積分
+
+**設定** (プローブの Details の OCIO、またはモニターの「色の基準」)
+
+| 項目 | 内容 |
+|------|------|
+| **OCIO** (`OCIO Source`) | `Auto (nDisplay)` (既定): Post Process Source が nDisplay なら、nDisplay が外側ビューポートに掛ける OCIO を自動で使う。`Manual`: プローブの `OCIO Settings` を使う。`Off` |
+| `Wall Display EOTF` | OCIO の出力 (Display-View) に合わせる。sRGB / ガンマ 2.2 / 2.4 / **Gamma (Custom)** (`Wall Gamma`、例 2.35) / **PQ (ST 2084)** |
+| `PQ Reference White` | PQ のとき、正規化値 1.0 とする明るさ (既定 100 nits)。OCIO の構成がシーン値 1.0 を何 nits にしているかに合わせる (UE 同梱の例は 100 nits) |
+| `OCIO Display Gamut` | OCIO の出力の色域 (Rec.709 / P3-D65 / Rec.2020)。Display-View に合わせる |
+| OCIO の状態 | 掛けている変換 (例 `nDisplay の OCIO (ビューポート 'VP_0' のプロファイル): ...`)。シェーダーの準備ができるまでは、OCIO なしの値を出さないようキャプチャを見送る |
+
+nDisplay の OCIO の選び方は nDisplay と同じです。**All Viewports** の OCIO が有効なら、`NDisplay Viewport Id` を対象にした有効な **Per-Viewport** のプロファイル (先に見つかったもの)、なければ All Viewports の設定を使います。All Viewports が無効なら OCIO は掛けません。変換が未設定のものも nDisplay と同じく掛けません。
+
+キャリブレーション (壁の灰ステップによる応答カーブ、M_ref) は OCIO 後の値に対して行われるので、そのまま使えます。
+
+---
+
 ## 照明を送る PC
 
 照明 (DMX / OSC) は、**ネットワークでつながっていれば別の PC から送れます**。Art-Net / sACN / OSC はどれも UDP なので、送る PC と灯体 (または DMX ノード・照明卓) が同じ LAN にあれば届きます。
@@ -463,11 +495,11 @@ UnrealEditor-Cmd <Project>.uproject -ExecCmds="Automation RunTests LightSync; Qu
 
 | グループ | 内容 |
 |----------|------|
-| `LightSync.Zones.*` | 立体角の合計 = 4π、一様環境 = 1.0、半球、分割で二重計上しない、除外、回転、Key の方向、EOTF のデコード、変化の検出 |
+| `LightSync.Zones.*` | 立体角の合計 = 4π、一様環境 = 1.0、半球、分割で二重計上しない、除外、回転、Key の方向、EOTF のデコード (PQ の既知の値、任意ガンマ)、表示の色域、変化の検出 |
 | `LightSync.ColorMath.*` | 色空間、CCT/Duv (D65 → 6504K、Planck 往復)、ソルバ、調光カーブ、量子化、Log の線形化、フィット |
 | `LightSync.Fixture.*` | 各プリセットの DMX 値、Dimmer 分離、ガンマ逆変換、16bit、キャリブレーション適用、ブラックアウト |
 | `LightSync.Calibration.*` | 合成した測定値から応答・ガンマ・LUT・M_ref・壁の応答カーブを復元。校正後に灯体の光がカメラ上で壁と一致する |
-| `LightSync.NDisplay.*` | レイヤー合成の規則 |
+| `LightSync.NDisplay.*` | レイヤー合成の規則、OCIO の選び方 (All Viewports / Per-Viewport) |
 | `LightSync.Output.*` | どの PC が送るか (方針・クラスタノード・起動引数)、直接ブラックアウトのパケット (Art-Net 4 / E1.31) |
 
 ### GPU の検証
@@ -488,6 +520,8 @@ LightSync.ValidateGPU
 - キャリブレーション: パッチの測定、M_ref の復元、テスト点灯の送信、映像の読み取り
 - nDisplay: ICVFX テンプレートの設定で、合成結果が理論どおり。同じ PP を持つ参照カメラと描画結果が一致
 - 壁の応答ガンマ 1.2: プローブの出力が、ガンマなしの値の 1.2 乗と一致
+- OCIO (UE 同梱の構成 `simple.config.ocio`): PQ / Gamma 2.35 / UE の見た目の再現 (LUT) のどれも、同じ露出の 2D キャプチャにエンジンの OCIO (`OpenColorIOLibrary`) を掛けてデコードした値と 0.01% 以内で一致。nDisplay の All Viewports / Per-Viewport の OCIO を自動で選んだ場合も同じ。GPU と CPU の差は 0.003% 以下
+- 露出の尺度: 同じ参照カメラ (Manual、EV0) で、Scene Light モードはシーン値そのもの、LED Wall モード (グレーディングを無効にし OCIO で恒等変換) との差は 1.2% (エンジンのカラーグレーディング LUT の精度)
 - 送信の制御: `-LightSyncOutput=Off` でパケット 0・キャプチャ 0
 - 終了時: エディタ / -game / パッケージ版を閉じた後、最後に届いた Art-Net と OSC がブラックアウト (コンソールウィンドウを閉じた場合も)
 
@@ -501,7 +535,7 @@ LightSync.ValidateGPU
 - **ポストプロセスボリューム** はプローブの位置で評価されます。nDisplay の視点と同じボリュームの中に置いてください (Unbound なら問題ありません)
 - 参照カメラの露出が **Auto** の場合は Manual として計算します。ICVFX では Manual 露出を推奨します
 - nDisplay の **Start** カスタム PP は「シーンの下」に入るのが本来の順序です。プローブではボリュームの評価順を完全には再現できません (通常の運用では使われない内部項目です)
-- **OCIO** を使う nDisplay 構成には未対応です (OCIO 変換後の信号を前提にした EOTF 選択が必要)
+- **OCIO**: 内側フラスタム (ICVFX カメラ) とライトカードの OCIO は使いません。照明の基準は外側ビューポート (壁の環境) です
 - 内蔵プリセットのアンバーは近似値です。RGBAW 灯体はキャリブレーションしてください
 - **PIE 中** は、エディタワールド側のプローブは送信しません (二重送信を防ぐため)
 - 最大ゾーン数は 8 です
@@ -534,7 +568,7 @@ LightSync.ValidateGPU
 ### 動作要件
 
 - Unreal Engine 5.7 (ビルド済みバイナリは 5.7 専用)、Win64
-- DMX Protocol / DMX Engine / OSC プラグイン (UE 同梱)
+- DMX Protocol / DMX Engine / OSC / OpenColorIO プラグイン (UE 同梱。自動で有効になる)
 - Art-Net / sACN 対応の DMX インターフェース (DMX を直接出す場合)
 - nDisplay (任意。連携を使う場合)
 
@@ -592,7 +626,8 @@ LightSyncDMX/
     │   ├── LightSyncFixtureProfile                 灯体プロファイル、プリセット、DMX 値の計算
     │   ├── DMXColorOutputComponent / OSCColorOutputComponent
     │   ├── LightSyncCalibrator / LightSyncCalibrationPatch
-    │   ├── LightSyncNDisplay                       nDisplay の PP 合成 (リフレクション)
+    │   ├── LightSyncNDisplay                       nDisplay の PP 合成と OCIO の選択 (リフレクション)
+    │   ├── LightSyncOCIO                           OCIO の変換をキャプチャに掛ける
     │   ├── LightSyncSettings                       Project Settings、どの PC が送るか
     │   ├── LightSyncDirectOutput                   終了時の直接ブラックアウト (Art-Net / sACN)
     │   ├── LightSyncSubsystem / LightSyncBlueprintLibrary
@@ -601,6 +636,12 @@ LightSyncDMX/
 ```
 
 ---
+
+## 2.0 → 2.1 の変更
+
+- **Scene Light モードの露出を修正**: 2.0 は UE の手動露出に 0.18 を余計に掛けていました (0.18 を掛けるのは自動露出のときだけ)。同じ露出設定で、Scene Light モードの値は 2.0 の約 5.6 倍 (= 1 / 0.18) になり、LED Wall モードと同じ尺度になります。2.0 で `Manual Exposure Bias` を +2.47 (= log2(1/0.18)) などで補っていた場合は、その分を戻してください
+- OCIO (PQ / 任意ガンマ / 表示の色域) に対応
+- 変化がないときは更新を減らす (既定オフ)
 
 ## 1.x からの移行
 

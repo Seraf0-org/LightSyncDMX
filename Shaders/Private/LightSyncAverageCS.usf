@@ -44,7 +44,12 @@
 #define ZONE_KEY        4
 #define ZONE_EXCLUDE    5
 
+// 入力: キューブ (通常) か、6 面を横に並べたアトラス (OCIO を掛けたもの。面 f は x = f*N .. f*N+N-1)
+#ifndef INPUT_ATLAS
+#define INPUT_ATLAS 0
+#endif
 TextureCube<float4> InputCube;
+Texture2D<float4>   InputAtlas;
 SamplerState        InputSampler;
 RWStructuredBuffer<float4> OutputBuffer;
 
@@ -60,8 +65,14 @@ float4 ZoneDirShape[MAX_ZONES];
 float4 ZoneParams[MAX_ZONES];
 
 // 入力の伝達関数 (texel ごとにデコードしてから積分する。非線形なので積分後には掛けられない)
-//   0 = リニア, 1 = sRGB EOTF, 2 = ガンマ 2.2, 3 = ガンマ 2.4
+//   0 = リニア, 1 = sRGB EOTF, 2 = ガンマ 2.2, 3 = ガンマ 2.4, 4 = PQ (ST 2084), 5 = 任意のガンマ (DecodeGamma)
 uint InputTransfer;
+
+// InputTransfer = 5 のガンマ
+float DecodeGamma;
+
+// InputTransfer = 4 のとき: 10000 / 基準白 (nits)。PQ のコード値を「1.0 = 基準白」に直す
+float PQScale;
 
 // デコード後に掛ける補正ガンマ (壁の実際の応答。キャリブレーションで求める。1 = なし)
 float TransferGamma;
@@ -139,12 +150,31 @@ float3 DecodeTransfer(float3 v)
     {
         return pow(max(v, 0.0f), 2.4f);
     }
+    if (InputTransfer == 4u)
+    {
+        // SMPTE ST 2084 EOTF (0-1 = 0-10000 nits)
+        const float m1 = 2610.0f / 16384.0f;
+        const float m2 = 2523.0f / 4096.0f * 128.0f;
+        const float c1 = 3424.0f / 4096.0f;
+        const float c2 = 2413.0f / 4096.0f * 32.0f;
+        const float c3 = 2392.0f / 4096.0f * 32.0f;
+        float3 p = pow(saturate(v), 1.0f / m2);
+        return pow(max(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1) * PQScale;
+    }
+    if (InputTransfer == 5u)
+    {
+        return pow(max(v, 0.0f), DecodeGamma);
+    }
     return v;
 }
 
-float3 LoadRadiance(float3 dir)
+float3 LoadRadiance(uint face, uint x, uint y, float3 dir)
 {
+#if INPUT_ATLAS
+    float3 L = DecodeTransfer(InputAtlas.Load(int3(face * TextureSize + x, y, 0)).rgb);
+#else
     float3 L = DecodeTransfer(InputCube.SampleLevel(InputSampler, dir, 0).rgb);
+#endif
     if (TransferGamma != 1.0f)
     {
         L = pow(max(L, 0.0f), TransferGamma);
@@ -228,7 +258,7 @@ void MainPeakCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThread
             float2 uv = (float2(x, y) + 0.5f) / (float)TextureSize;
             float3 dir = normalize(FaceUVToDirection(face, uv));
             float dOmega = TexelSolidAngle(uv) * ExclusionKeep(dir);
-            float lum = dot(LoadRadiance(dir), LuminanceCoeffs);
+            float lum = dot(LoadRadiance(face, x, y, dir), LuminanceCoeffs);
             lumSum += lum * dOmega;
             omegaSum += dOmega;
             dirSum += dir * lum * dOmega;
@@ -279,7 +309,7 @@ void MainRefineCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThre
                 {
                     continue;
                 }
-                float w = dot(LoadRadiance(dir), LuminanceCoeffs) * TexelSolidAngle(uv) * ExclusionKeep(dir);
+                float w = dot(LoadRadiance(face, x, y, dir), LuminanceCoeffs) * TexelSolidAngle(uv) * ExclusionKeep(dir);
                 acc += float4(dir * w, w);
             }
         }
@@ -338,7 +368,7 @@ void MainZonesCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThrea
             float2 uv = (float2(x, y) + 0.5f) / (float)TextureSize;
             float3 dir = normalize(FaceUVToDirection(face, uv));
             float dOmega = TexelSolidAngle(uv);
-            float3 L = LoadRadiance(dir);
+            float3 L = LoadRadiance(face, x, y, dir);
             float keep = ExclusionKeep(dir);
 
             // 分割ゾーンの親和度
@@ -457,4 +487,22 @@ void MainZonesReduceCS(uint GroupIndex : SV_GroupIndex)
             OutputBuffer[ZONES_TOTAL + z] = sum;
         }
     }
+}
+
+// -------------------------------------------------------------------
+// キューブ → 面アトラス (OCIO を掛ける前の並べ替え)。texel の向きは FaceUVToDirection と同じ
+// -------------------------------------------------------------------
+RWTexture2D<float4> AtlasOutput;
+
+[numthreads(8, 8, 1)]
+void MainCubeToAtlasCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const uint face = DispatchThreadId.z;
+    if (DispatchThreadId.x >= TextureSize || DispatchThreadId.y >= TextureSize)
+    {
+        return;
+    }
+    float2 uv = (float2(DispatchThreadId.xy) + 0.5f) / (float)TextureSize;
+    float3 dir = normalize(FaceUVToDirection(face, uv));
+    AtlasOutput[uint2(face * TextureSize + DispatchThreadId.x, DispatchThreadId.y)] = InputCube.SampleLevel(InputSampler, dir, 0);
 }

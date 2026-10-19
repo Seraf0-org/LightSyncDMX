@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 3,
-	"VersionName": "2.0",
+	"Version": 4,
+	"VersionName": "2.1",
 	"FriendlyName": "LightSync DMX",
-	"Description": "VP用 - プローブ位置の光を立体角で正しくゾーン積分し、灯体プロファイルとソルバでカメラ上の色を一致させて DMX/OSC 出力。LEDウォール基準/シーン基準、カメラだけのキャリブレーション、nDisplay のグレーディング連携に対応。",
+	"Description": "VP用 - プローブ位置の光を立体角で正しくゾーン積分し、灯体プロファイルとソルバでカメラ上の色を一致させて DMX/OSC 出力。LEDウォール基準/シーン基準、カメラだけのキャリブレーション、nDisplay のグレーディング・OCIO 連携に対応。",
 	"Category": "Virtual Production",
 	"CreatedBy": "UE-Comp",
 	"CreatedByURL": "",
@@ -48,6 +48,10 @@
 		},
 		{
 			"Name": "OSC",
+			"Enabled": true
+		},
+		{
+			"Name": "OpenColorIO",
 			"Enabled": true
 		}
 	]
